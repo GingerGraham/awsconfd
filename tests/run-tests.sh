@@ -604,7 +604,28 @@ section "Watch"
 
 setup_case "watch_no_init_system"
 "$BIN" init -y >/dev/null 2>&1
-out="$("$BIN" watch --install 2>&1)"
+
+# Force "no init system" detection regardless of the host's real session
+# state. On a machine with a live systemd --user session, XDG_RUNTIME_DIR/
+# systemd/private exists and is checked *before* is-system-running, so
+# without this the test exercises the real systemd install path against
+# the real user manager and fails (unit written under the test's fake
+# XDG_CONFIG_HOME is invisible to the already-running manager).
+#
+# B6.7 names _systemctl/_launchctl as the intended stub points, but those
+# only help when the script is sourced; here it's exec'd as a subprocess,
+# so a PATH shim is the black-box equivalent.
+_fakebin="${_case_dir}/fakebin"
+mkdir -p "$_fakebin"
+cat > "$_fakebin/systemctl" << 'EOF'
+#!/bin/sh
+# Stub: always behave like a non-live/offline user session.
+echo offline
+exit 1
+EOF
+chmod +x "$_fakebin/systemctl"
+
+out="$(PATH="${_fakebin}:${PATH}" XDG_RUNTIME_DIR="${_case_dir}/no-runtime-dir" "$BIN" watch --install 2>&1)"
 rc=$?
 assert_exit "watch --install with no systemd/launchd exits 0" "0" "$rc"
 assert_contains "watch --install prints Layer-3 recommendation" "$out" "hook"
