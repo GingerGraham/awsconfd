@@ -113,11 +113,11 @@ awsconfd --help
 ```
 
 | Command                                 | What it does                                                       |
-| --------------------------------------- | ------------------------------------------------------------------ | ----------------------------------------------------- |
+| --------------------------------------- | ------------------------------------------------------------------ |
 | `init`                                  | Create `config.d`, import any existing config, and run first build |
 | `add-sso [NAME]`                        | Add or update an `[sso-session ...]` block                         |
 | `add-profile [NAME]`                    | Add or update a `[profile ...]` block                              |
-| `apply --spec FILE                      | -`                                                                 | Generate fragments from a spec file, then build       |
+| `apply --spec FILE \| -`                | Generate fragments from a spec file (or stdin), then build         |
 | `build`                                 | Assemble `~/.aws/config` from fragments                            |
 | `status`                                | Show fragments, staleness, and watcher state                       |
 | `doctor [--fix]`                        | Validate fragments; optionally repair auto-fixable issues          |
@@ -128,7 +128,7 @@ awsconfd --help
 | `watch --install`                       | Install watcher integration (systemd or launchd)                   |
 | `watch --status`                        | Show watcher status                                                |
 | `watch --uninstall`                     | Remove watcher integration                                         |
-| `hook bash                              | zsh`                                                               | Print shell hook snippet for prompt-time stale checks |
+| `hook bash \| zsh`                      | Print shell hook snippet for prompt-time stale checks              |
 | `self-update`                           | Placeholder command (not implemented yet)                          |
 | `uninstall [--purge]`                   | Uninstall watcher; optionally restore backup/purge state           |
 
