@@ -1,0 +1,3153 @@
+#!/bin/bash
+# awsconfd - AWS CLI config.d fragment manager
+# https://github.com/GingerGraham/awsconfd
+#
+# No dependencies beyond POSIX userland + bash 3.2 + coreutils that exist on
+# both GNU and BSD systems. See docs/ for the full spec this implements.
+set -euo pipefail
+
+readonly PROG="awsconfd"
+readonly VERSION="0.2.0"
+
+# nullglob is set once, globally, here - never inside a subshell, never
+# toggled elsewhere. An unmatched "*.conf" glob then expands to nothing
+# instead of the literal pattern.
+shopt -s nullglob
+
+# --- Path resolution -------------------------------------------------------
+# AWSCONFD_CONFIG_FILE / AWSCONFD_CONFIG_DIR are re-derived after flag
+# parsing in main() (see A6.2) so that --config-file alone still relocates
+# config.d correctly.
+: "${AWSCONFD_CONFIG_FILE:=${AWS_CONFIG_FILE:-$HOME/.aws/config}}"
+: "${AWSCONFD_CONFIG_DIR:=}"
+AWSCONFD_CONFIG_DIR_EXPLICIT=0
+if [[ -n $AWSCONFD_CONFIG_DIR ]]; then
+    AWSCONFD_CONFIG_DIR_EXPLICIT=1
+else
+    AWSCONFD_CONFIG_DIR="$(dirname "$AWSCONFD_CONFIG_FILE")/config.d"
+fi
+: "${XDG_CONFIG_HOME:=$HOME/.config}"
+AWSCONFD_STATE_DIR="${XDG_CONFIG_HOME}/awsconfd"
+SCHEME_FILE="${AWSCONFD_STATE_DIR}/scheme.conf"
+
+# Banner sentinel - the single machine-readable line every "is this file
+# generated?" check greps for (A5.3). Human-readable banner text may change
+# freely; this line must not.
+readonly BANNER_SENTINEL="# awsconfd-generated: v1"
+
+# --- State (set by global flag parsing) ------------------------------------
+VERBOSE=0
+QUIET=0
+DRY_RUN=0
+NO_COLOR=0
+ASSUME_YES=0
+STRICT=0
+NO_PROVENANCE=0
+NON_INTERACTIVE=0
+
+# --- Colour ------------------------------------------------------------
+RED=""; YELLOW=""; GREEN=""; BLUE=""; RESET=""
+
+_init_colors() {
+    RED=""; YELLOW=""; GREEN=""; BLUE=""; RESET=""
+    # Coloured only when: --no-color was not passed, the NO_COLOR env var is
+    # unset (https://no-color.org), and stderr (where all our messages go)
+    # is a tty.
+    if [[ $NO_COLOR -eq 0 && -z ${NO_COLOR+x} && -t 2 ]]; then
+        RED=$'\033[31m'
+        YELLOW=$'\033[33m'
+        GREEN=$'\033[32m'
+        BLUE=$'\033[34m'
+        RESET=$'\033[0m'
+    fi
+    return 0
+}
+
+# --- Logging -----------------------------------------------------------
+# A0.2: every logging function ends with an explicit `return 0`. A `[[ cond
+# ]] && cmd` as the last statement returns 1 when cond is false, which under
+# `set -e` kills the *caller* the next time that failing status is used as a
+# simple command's exit status.
+_info() {
+    if [[ $QUIET -eq 0 ]]; then
+        printf '%sINFO:%s %s\n' "$BLUE" "$RESET" "$*" >&2
+    fi
+    return 0
+}
+
+_warn() {
+    printf '%sWARN:%s %s\n' "$YELLOW" "$RESET" "$*" >&2
+    return 0
+}
+
+_err() {
+    printf '%sERROR:%s %s\n' "$RED" "$RESET" "$*" >&2
+    return 0
+}
+
+_success() {
+    if [[ $QUIET -eq 0 ]]; then
+        printf '%sOK:%s %s\n' "$GREEN" "$RESET" "$*" >&2
+    fi
+    return 0
+}
+
+_verbose() {
+    if [[ $VERBOSE -eq 1 ]]; then
+        printf '%sDEBUG:%s %s\n' "$BLUE" "$RESET" "$*" >&2
+    fi
+    return 0
+}
+
+# --- Small portable helpers ----------------------------------------------
+
+# Trim leading/trailing whitespace. A7: the old `${s#[[:space:]]}` form only
+# strips one character; this form strips the whole run.
+_trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+# Collapse an absolute path under $HOME to "~/...". Used only for display
+# text (banner, messages), never for anything a machine parses.
+_display_path() {
+    local p="$1"
+    case "$p" in
+        "$HOME"/*) printf '~/%s\n' "${p#"$HOME"/}" ;;
+        "$HOME") printf '~\n' ;;
+        *) printf '%s\n' "$p" ;;
+    esac
+}
+
+# Resolve this script's own absolute path without readlink -f / realpath
+# (both forbidden - absent or inconsistent on stock macOS).
+_self_path() {
+    local p="$0"
+    case "$p" in
+        */*) ;;
+        *) p="$(command -v "$0" 2>/dev/null || true)" ;;
+    esac
+    [[ -n $p ]] || return 1
+    local dir base
+    dir="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)" || return 1
+    base="$(basename "$p")"
+    printf '%s/%s\n' "$dir" "$base"
+    return 0
+}
+
+# Read every line of a file into the global LINES[] array (1-indexed by
+# convention: LINES[0] is line 1). Bash 3.2 has no mapfile/readarray.
+LINES=()
+_read_lines_into_array() {
+    LINES=()
+    local line
+    while IFS= read -r line || [[ -n $line ]]; do
+        LINES+=("$line")
+    done < "$1"
+    return 0
+}
+
+# Prompt on /dev/tty, never stdin (A8: `! -t 0` is the wrong test - under
+# `curl | bash` stdin is the pipe, but /dev/tty is live, which is the whole
+# point of the wizard working under a pipe).
+_prompt_user() {
+    local prompt="$1" default="${2:-}"
+    local response
+
+    if [[ $NON_INTERACTIVE -eq 1 ]]; then
+        if [[ -n $default ]]; then
+            printf '%s\n' "$default"
+            return 0
+        fi
+        _err "no value for '${prompt}' and --non-interactive was given"
+        return 2
+    fi
+
+    if [[ ! -r /dev/tty ]]; then
+        if [[ -n $default ]]; then
+            printf '%s\n' "$default"
+            return 0
+        fi
+        _err "no controlling terminal (/dev/tty) and no default for '${prompt}'"
+        _err "re-run with explicit flags, or use --non-interactive with --yes where a default exists"
+        return 2
+    fi
+
+    if [[ -n $default ]]; then
+        read -r -p "${prompt} [${default}]: " response < /dev/tty
+        printf '%s\n' "${response:-$default}"
+    else
+        read -r -p "${prompt}: " response < /dev/tty
+        printf '%s\n' "$response"
+    fi
+    return 0
+}
+
+# Yes/no confirmation. Honours --yes. Returns 0 for yes, 1 for no.
+_confirm() {
+    local prompt="$1" default_yes="${2:-0}"
+
+    if [[ $ASSUME_YES -eq 1 ]]; then
+        return 0
+    fi
+    if [[ $NON_INTERACTIVE -eq 1 ]]; then
+        return 1
+    fi
+    if [[ ! -r /dev/tty ]]; then
+        return 1
+    fi
+
+    local suffix="y/N" response
+    [[ $default_yes -eq 1 ]] && suffix="Y/n"
+    read -r -p "${prompt} [${suffix}]: " response < /dev/tty
+    if [[ -z $response ]]; then
+        [[ $default_yes -eq 1 ]] && return 0 || return 1
+    fi
+    case "$response" in
+        y|Y|yes|YES|Yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_show_version() {
+    printf '%s version %s\n' "$PROG" "$VERSION"
+    return 0
+}
+
+# =============================================================================
+# INI PARSING (spec §7)
+# =============================================================================
+# Deliberately shallow: identifies section headers and, separately, top-level
+# (non-indented) keys. Everything else passes through untouched. Indented
+# lines (nested settings such as an `s3 =` block) are opaque body content -
+# a key line only counts as a top-level key if it has zero leading
+# whitespace (A7 / spec §7).
+
+# Sets HDR_CONTENT (trimmed bracket contents) and returns 0 if $1 is a
+# section header line.
+HDR_CONTENT=""
+_is_header_line() {
+    local line="$1"
+    if [[ $line =~ ^[[:space:]]*\[(.+)\][[:space:]]*$ ]]; then
+        HDR_CONTENT="$(_trim "${BASH_REMATCH[1]}")"
+        return 0
+    fi
+    return 1
+}
+
+# Classifies bracket contents into HDR_TYPE / HDR_NAME per the §7 table.
+HDR_TYPE=""
+HDR_NAME=""
+_classify_header() {
+    local content="$1"
+    HDR_TYPE=""
+    HDR_NAME=""
+    if [[ $content == "default" ]]; then
+        HDR_TYPE="default"
+        HDR_NAME="default"
+        return 0
+    fi
+    # Closed set per spec §7's table: only these three split into type+name.
+    # Everything else - including a future AWS section type this script
+    # doesn't know about yet - is passed through as unknown/raw rather than
+    # guessed at, per the table's explicit "anything else -> unknown, raw".
+    if [[ $content =~ ^(profile|sso-session|services)[[:space:]]+(.+)$ ]]; then
+        HDR_TYPE="${BASH_REMATCH[1]}"
+        HDR_NAME="$(_trim "${BASH_REMATCH[2]}")"
+    else
+        HDR_TYPE="unknown"
+        HDR_NAME="$content"
+    fi
+    return 0
+}
+
+# _parse_sections <file>
+# Emits, one per line: type|name|file|line_no
+# A0.1 fix: every line-counter increment is `n=$((n+1))`, never `((n++))`.
+_parse_sections() {
+    local file="$1"
+    local ln=0
+    local line
+    while IFS= read -r line || [[ -n $line ]]; do
+        ln=$((ln + 1))
+        if _is_header_line "$line"; then
+            _classify_header "$HDR_CONTENT"
+            printf '%s|%s|%s|%s\n' "$HDR_TYPE" "$HDR_NAME" "$file" "$ln"
+        fi
+    done < "$file"
+    return 0
+}
+
+# _parse_keys <file>
+# Emits, one per line: section_type|section_name|key|value|line_no
+# Only top-level keys (no leading whitespace) are emitted; indented lines
+# (nested settings) are skipped entirely, per A7/§7. Trailing inline
+# comments are stripped from the value for validation purposes only - the
+# fragment on disk is never touched by this function.
+_parse_keys() {
+    local file="$1"
+    local cur_type="" cur_name=""
+    local ln=0
+    local line
+    while IFS= read -r line || [[ -n $line ]]; do
+        ln=$((ln + 1))
+        local trimmed
+        trimmed="$(_trim "$line")"
+        [[ -z $trimmed ]] && continue
+        case "${trimmed:0:1}" in
+            '#'|';') continue ;;
+        esac
+        if _is_header_line "$line"; then
+            _classify_header "$HDR_CONTENT"
+            cur_type="$HDR_TYPE"
+            cur_name="$HDR_NAME"
+            continue
+        fi
+        # Leading whitespace => indented/nested => not a top-level key.
+        if [[ "$line" != "${line#[[:space:]]}" ]]; then
+            continue
+        fi
+        if [[ $line =~ ^([A-Za-z0-9_-]+)[[:space:]]*=(.*)$ ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+            # Strip a trailing inline comment for validation purposes only.
+            value="${value%%#*}"
+            value="$(_trim "$value")"
+            printf '%s|%s|%s|%s|%s\n' "$cur_type" "$cur_name" "$key" "$value" "$ln"
+        fi
+    done < "$file"
+    return 0
+}
+
+# =============================================================================
+# FRAGMENT DISCOVERY (spec §5.2)
+# =============================================================================
+
+# _discover_fragments <dir>
+# Emits one fragment path per line, in LC_ALL=C lexical order. Only *.conf;
+# symlinks are followed ([[ -f ]] follows them); *.conf.disabled, dotfiles,
+# and anything else is excluded. Directories under config.d are ignored.
+_discover_fragments() {
+    local dir="$1"
+    [[ -d $dir ]] || return 1
+    (
+        LC_ALL=C
+        for f in "$dir"/*.conf; do
+            [[ -f $f ]] && printf '%s\n' "$f"
+        done
+    )
+    return 0
+}
+
+_fragment_basename_ok() {
+    local bn="$1"
+    [[ $bn =~ ^[0-9]{2}-[a-z0-9][a-z0-9._-]*\.conf$ ]]
+}
+
+# sha256 of the concatenated *bodies* (not the banner) of a list of files,
+# using whichever of sha256sum/shasum exists. Prints nothing (not even a
+# blank line) if neither tool is present - the caller omits the digest line
+# entirely rather than substitute anything non-deterministic (A5.2).
+_fragments_digest() {
+    local hash_cmd=""
+    if command -v sha256sum >/dev/null 2>&1; then
+        hash_cmd="sha256sum"
+    elif command -v shasum >/dev/null 2>&1; then
+        hash_cmd="shasum -a 256"
+    else
+        return 0
+    fi
+    local f
+    { for f in "$@"; do cat "$f"; done; } | $hash_cmd | awk '{print $1}'
+    return 0
+}
+
+# =============================================================================
+# SECTION-UPDATE PRIMITIVE (review doc B1)
+# =============================================================================
+# Replace exactly one [section] block inside a fragment, leaving every other
+# byte of the file untouched. Everything in add-sso / add-profile / apply
+# rests on this.
+
+# _section_extent <file> <header>
+# Sets SECTION_START / SECTION_END (1-indexed, inclusive). Returns 1 if the
+# section does not exist. Populates LINES[] as a side effect.
+SECTION_START=""
+SECTION_END=""
+_section_extent() {
+    local file="$1" header="$2"
+    _read_lines_into_array "$file"
+    local n=${#LINES[@]}
+    local start="" next=""
+    local idx=1
+    while [[ $idx -le $n ]]; do
+        local line="${LINES[$((idx - 1))]}"
+        if _is_header_line "$line"; then
+            if [[ -z $start ]]; then
+                if [[ $HDR_CONTENT == "$header" ]]; then
+                    start=$idx
+                fi
+            else
+                next=$idx
+                break
+            fi
+        fi
+        idx=$((idx + 1))
+    done
+    [[ -z $start ]] && return 1
+
+    local scan_end
+    if [[ -n $next ]]; then
+        scan_end=$((next - 1))
+    else
+        scan_end=$n
+    fi
+
+    local end=$start
+    idx=$scan_end
+    while [[ $idx -ge $start ]]; do
+        local line="${LINES[$((idx - 1))]}"
+        local trimmed
+        trimmed="$(_trim "$line")"
+        if [[ -n $trimmed ]]; then
+            case "${trimmed:0:1}" in
+                '#'|';') : ;;
+                *) end=$idx; break ;;
+            esac
+        fi
+        idx=$((idx - 1))
+    done
+
+    SECTION_START=$start
+    SECTION_END=$end
+    return 0
+}
+
+_section_exists() {
+    _section_extent "$1" "$2"
+}
+
+# _section_read <file> <header> - prints the block to stdout.
+_section_read() {
+    local file="$1" header="$2"
+    _section_extent "$file" "$header" || return 1
+    local i=$SECTION_START
+    while [[ $i -le $SECTION_END ]]; do
+        printf '%s\n' "${LINES[$((i - 1))]}"
+        i=$((i + 1))
+    done
+    return 0
+}
+
+# _section_upsert <file> <header> <body_file>
+# Rewrites <file> in place: head(1..start-1) + body_file + tail(end+1..EOF).
+# If the section does not exist, appends it (ensuring the file ends with a
+# newline first, then one blank line, then the block). Atomic: builds in a
+# mktemp file beside the target, chmod 0600, mv. Trapped on EXIT/INT/TERM so
+# an interrupted upsert leaves the original untouched and no temp file
+# behind.
+_section_upsert() {
+    local file="$1" header="$2" body_file="$3"
+    local dir tmp
+    dir="$(dirname "$file")"
+    tmp="$(mktemp "${dir}/.awsconfd.XXXXXX")"
+    trap 'rm -f "$tmp"' EXIT INT TERM
+
+    if [[ -f $file ]] && _section_extent "$file" "$header"; then
+        local n=${#LINES[@]}
+        : > "$tmp"
+        if [[ $SECTION_START -gt 1 ]]; then
+            local i=1
+            while [[ $i -le $((SECTION_START - 1)) ]]; do
+                printf '%s\n' "${LINES[$((i - 1))]}"
+                i=$((i + 1))
+            done >> "$tmp"
+        fi
+        cat "$body_file" >> "$tmp"
+        if [[ $SECTION_END -lt $n ]]; then
+            local i=$((SECTION_END + 1))
+            while [[ $i -le $n ]]; do
+                printf '%s\n' "${LINES[$((i - 1))]}"
+                i=$((i + 1))
+            done >> "$tmp"
+        fi
+    else
+        : > "$tmp"
+        if [[ -f $file ]]; then
+            cat "$file" >> "$tmp"
+            if [[ -s $tmp ]]; then
+                if [[ -n "$(tail -c 1 "$tmp")" ]]; then
+                    printf '\n' >> "$tmp"
+                fi
+                printf '\n' >> "$tmp"
+            fi
+        fi
+        cat "$body_file" >> "$tmp"
+    fi
+
+    chmod 0600 "$tmp"
+    mv "$tmp" "$file"
+    trap - EXIT INT TERM
+    return 0
+}
+
+# _section_delete <file> <header> - removes the block (including one
+# adjacent separating blank line where present). Used by nothing in the
+# current command set yet, but is part of the B1.2 primitive contract.
+_section_delete() {
+    local file="$1" header="$2"
+    _section_extent "$file" "$header" || return 1
+    local n=${#LINES[@]}
+    local dir tmp
+    dir="$(dirname "$file")"
+    tmp="$(mktemp "${dir}/.awsconfd.XXXXXX")"
+    trap 'rm -f "$tmp"' EXIT INT TERM
+    : > "$tmp"
+    local i=1
+    while [[ $i -le $n ]]; do
+        if [[ $i -ge $SECTION_START && $i -le $SECTION_END ]]; then
+            i=$((i + 1))
+            continue
+        fi
+        # Skip a single blank line immediately following the deleted block.
+        if [[ $i -eq $((SECTION_END + 1)) && -z "$(_trim "${LINES[$((i - 1))]}")" ]]; then
+            i=$((i + 1))
+            continue
+        fi
+        printf '%s\n' "${LINES[$((i - 1))]}"
+        i=$((i + 1))
+    done >> "$tmp"
+    chmod 0600 "$tmp"
+    mv "$tmp" "$file"
+    trap - EXIT INT TERM
+    return 0
+}
+
+# Render a section deterministically (review B1.3): canonical keys in
+# canonical order, then any keys not in the canonical list in the order
+# they were read from an existing section (so hand-added keys survive an
+# update). No trailing blank line inside the block.
+#
+# Inputs (globals, set by the caller before invoking):
+#   RENDER_KEYS[] / RENDER_VALS[]     - new/authoritative key-value pairs
+#   EXISTING_KEYS[] / EXISTING_VALS[] - prior values, for merge on update
+#                                        (empty arrays for a brand-new section)
+#
+# _render_section <header> <canonical_key_list> <out_file>
+RENDER_KEYS=()
+RENDER_VALS=()
+EXISTING_KEYS=()
+EXISTING_VALS=()
+_render_section() {
+    local header="$1" canon="$2" out="$3"
+    : > "$out"
+    printf '[%s]\n' "$header" >> "$out"
+
+    local -a emitted=()
+    local k
+    for k in $canon; do
+        local v="" found=0
+        local m=0
+        while [[ $m -lt ${#RENDER_KEYS[@]} ]]; do
+            if [[ "${RENDER_KEYS[$m]}" == "$k" ]]; then
+                v="${RENDER_VALS[$m]}"
+                found=1
+                break
+            fi
+            m=$((m + 1))
+        done
+        if [[ $found -eq 0 ]]; then
+            m=0
+            while [[ $m -lt ${#EXISTING_KEYS[@]} ]]; do
+                if [[ "${EXISTING_KEYS[$m]}" == "$k" ]]; then
+                    v="${EXISTING_VALS[$m]}"
+                    found=1
+                    break
+                fi
+                m=$((m + 1))
+            done
+        fi
+        if [[ $found -eq 1 && -n $v ]]; then
+            printf '%s = %s\n' "$k" "$v" >> "$out"
+            emitted+=("$k")
+        fi
+    done
+
+    # Anything supplied in RENDER_KEYS but not part of the canonical list
+    # for this section type (e.g. a caller-supplied extra) - emit next.
+    local i=0
+    while [[ $i -lt ${#RENDER_KEYS[@]} ]]; do
+        local rk="${RENDER_KEYS[$i]}" already=0
+        for k in $canon; do
+            [[ "$k" == "$rk" ]] && already=1 && break
+        done
+        for k in ${emitted[@]+"${emitted[@]}"}; do
+            [[ "$k" == "$rk" ]] && already=1 && break
+        done
+        if [[ $already -eq 0 && -n "${RENDER_VALS[$i]}" ]]; then
+            printf '%s = %s\n' "$rk" "${RENDER_VALS[$i]}" >> "$out"
+            emitted+=("$rk")
+        fi
+        i=$((i + 1))
+    done
+
+    # Leftover existing keys not covered above - hand-added keys survive.
+    local m=0
+    while [[ $m -lt ${#EXISTING_KEYS[@]} ]]; do
+        local ek="${EXISTING_KEYS[$m]}" already=0
+        for k in ${emitted[@]+"${emitted[@]}"}; do
+            [[ "$k" == "$ek" ]] && already=1 && break
+        done
+        if [[ $already -eq 0 ]]; then
+            printf '%s = %s\n' "$ek" "${EXISTING_VALS[$m]}" >> "$out"
+        fi
+        m=$((m + 1))
+    done
+    return 0
+}
+
+# Populate EXISTING_KEYS[]/EXISTING_VALS[] from an existing section's body
+# (top-level keys only; nested indented lines are dropped from the merge -
+# a documented simplification, see docs/validation.md).
+_load_existing_section_keys() {
+    local file="$1" header="$2"
+    EXISTING_KEYS=()
+    EXISTING_VALS=()
+    _section_exists "$file" "$header" || return 1
+    local line
+    while IFS= read -r line; do
+        [[ "$line" != "${line#[[:space:]]}" ]] && continue
+        if _is_header_line "$line"; then continue; fi
+        if [[ $line =~ ^([A-Za-z0-9_-]+)[[:space:]]*=(.*)$ ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local value
+            value="$(_trim "${BASH_REMATCH[2]}")"
+            EXISTING_KEYS+=("$key")
+            EXISTING_VALS+=("$value")
+        fi
+    done < <(_section_read "$file" "$header")
+    return 0
+}
+
+# =============================================================================
+# STALENESS (A1.1/A1.2/A2 fix)
+# =============================================================================
+# `[[ a -nt b ]]` is a bash builtin - no stat, no fork, no GNU/BSD split.
+# Never computed inside a `( ... )` subshell (A1.1's root cause): the value
+# this function needs to report escapes via its own return status, not a
+# variable set inside a pipeline or subshell.
+#
+# Staleness is compared against a marker file in AWSCONFD_STATE_DIR (outside
+# config.d, so touching it never self-triggers the watcher - constraint
+# 2.4), not against ~/.aws/config's own mtime. This is deliberate: the
+# no-op guarantee (§6.4) forbids build from touching the output file's
+# mtime when content is unchanged, but `touch`ing a fragment without
+# changing its content is still a legitimate "check again" signal that a
+# subsequent build run should be able to clear. The marker is updated on
+# every completed build (no-op or not); the output file's mtime is only
+# ever touched when its content actually changes.
+_last_build_marker() { printf '%s/.last-build\n' "$AWSCONFD_STATE_DIR"; }
+
+_touch_last_build_marker() {
+    mkdir -p "$AWSCONFD_STATE_DIR"
+    : > "$(_last_build_marker)"
+    return 0
+}
+
+_config_stale() {
+    local d="$AWSCONFD_CONFIG_DIR" c="$AWSCONFD_CONFIG_FILE"
+    local marker; marker="$(_last_build_marker)"
+    [[ -d $d ]] || return 1
+    [[ ! -f $c ]] && return 0
+    [[ ! -f $marker ]] && return 0
+    [[ $d -nt $marker ]] && return 0
+    local f
+    for f in "$d"/*.conf; do
+        [[ $f -nt $marker ]] && return 0
+    done
+    return 1
+}
+
+# =============================================================================
+# BUILD (spec §6)
+# =============================================================================
+
+_SKIP_BUILD_BACKUP=0
+
+_backup_path_for() {
+    local target="$1" n=1
+    while [[ -f "${target}.awsconfd-backup.${n}" ]]; do
+        n=$((n + 1))
+    done
+    printf '%s.awsconfd-backup.%s\n' "$target" "$n"
+}
+
+# True if the file carries the generated-file sentinel.
+_is_generated_file() {
+    local f="$1"
+    [[ -f $f ]] || return 1
+    grep -qF "$BANNER_SENTINEL" "$f" 2>/dev/null
+}
+
+_render_banner() {
+    local digest="$1"
+    local disp_dir
+    disp_dir="$(_display_path "$AWSCONFD_CONFIG_DIR")"
+    printf '# ==============================================================================\n'
+    printf '#  GENERATED FILE - DO NOT EDIT\n'
+    printf '#\n'
+    printf '#  This file is assembled by %s from the fragments in:\n' "$PROG"
+    printf '#      %s/*.conf\n' "$disp_dir"
+    printf '#\n'
+    printf '#  Any edit made here will be silently lost the next time the file is\n'
+    printf '#  rebuilt. Edit the fragments instead, then run:\n'
+    printf '#      %s build\n' "$PROG"
+    printf '#\n'
+    if [[ -n $digest ]]; then
+        printf '#  fragments-digest: %s\n' "$digest"
+    fi
+    printf '%s\n' "$BANNER_SENTINEL"
+    printf '# ==============================================================================\n'
+    return 0
+}
+
+cmd_build() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-provenance) NO_PROVENANCE=1; shift ;;
+            --dry-run) DRY_RUN=1; shift ;;
+            --strict) STRICT=1; shift ;;
+            *) _err "build: unknown option $1"; return 2 ;;
+        esac
+    done
+
+    _require_scheme_if_strict || return 2
+
+    if [[ ! -d $AWSCONFD_CONFIG_DIR ]]; then
+        _err "config.d not found: $AWSCONFD_CONFIG_DIR"
+        _err "Run '${PROG} init' first"
+        return 1
+    fi
+
+    # Step: validate (blocking rules only). On failure, print everything and
+    # do not touch the output file (A4).
+    _run_validation blocking
+    if [[ $_V_ERRORS -gt 0 ]]; then
+        _err "build: ${_V_ERRORS} validation error(s); output file not modified"
+        return 3
+    fi
+
+    local -a frags=()
+    local f
+    while IFS= read -r f; do
+        [[ -z $f ]] && continue
+        frags+=("$f")
+    done < <(_discover_fragments "$AWSCONFD_CONFIG_DIR")
+
+    local digest=""
+    if [[ ${#frags[@]} -gt 0 ]]; then
+        digest="$(_fragments_digest "${frags[@]}")"
+    fi
+
+    local outdir
+    outdir="$(dirname "$AWSCONFD_CONFIG_FILE")"
+    mkdir -p "$outdir"
+    local tmp
+    tmp="$(mktemp "${outdir}/.awsconfd.XXXXXX")"
+    trap 'rm -f "$tmp"' EXIT INT TERM
+
+    _render_banner "$digest" > "$tmp"
+
+    for f in ${frags[@]+"${frags[@]}"}; do
+        local bn
+        bn="$(basename "$f")"
+        printf '\n' >> "$tmp"
+        if [[ $NO_PROVENANCE -eq 0 ]]; then
+            printf '# ------------------------------------------------------------------ %s\n' "$bn" >> "$tmp"
+        fi
+        cat "$f" >> "$tmp"
+        # Compensate for a missing trailing newline without touching the
+        # fragment itself (A5.1: the old `od` check was always-true dead code).
+        if [[ -s $f ]] && [[ -n "$(tail -c 1 "$f")" ]]; then
+            printf '\n' >> "$tmp"
+        fi
+    done
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        cat "$tmp"
+        rm -f "$tmp"
+        trap - EXIT INT TERM
+        return 0
+    fi
+
+    # No-op path (§6.4): if identical to what's already there, touch nothing,
+    # not even the mtime. The last-build marker (outside config.d) still
+    # advances, so a fragment that was merely `touch`ed without changing
+    # content correctly stops reading as stale.
+    if [[ -f $AWSCONFD_CONFIG_FILE ]] && cmp -s "$tmp" "$AWSCONFD_CONFIG_FILE"; then
+        rm -f "$tmp"
+        trap - EXIT INT TERM
+        _touch_last_build_marker
+        _verbose "config is up to date, no-op"
+        return 0
+    fi
+
+    # Back up a hand-written config exactly once, only the first time we're
+    # about to overwrite a file that doesn't carry our banner (A3.1). A file
+    # that already carries the banner is our own prior output - no backup
+    # needed. _SKIP_BUILD_BACKUP lets `init` (which already took its own
+    # backup of the original file before importing it) avoid a redundant
+    # second backup of the same content.
+    if [[ $_SKIP_BUILD_BACKUP -eq 0 ]] && [[ -f $AWSCONFD_CONFIG_FILE ]] && ! _is_generated_file "$AWSCONFD_CONFIG_FILE"; then
+        local backup
+        backup="$(_backup_path_for "$AWSCONFD_CONFIG_FILE")"
+        cp -p "$AWSCONFD_CONFIG_FILE" "$backup"
+        _info "backed up existing hand-written config: $(_display_path "$backup")"
+    fi
+
+    chmod 0600 "$tmp"
+    mv "$tmp" "$AWSCONFD_CONFIG_FILE"
+    trap - EXIT INT TERM
+    _touch_last_build_marker
+
+    _success "config built: $(_display_path "$AWSCONFD_CONFIG_FILE")"
+
+    # Post-check (§9.4): non-fatal parser-disagreement canary.
+    if command -v aws >/dev/null 2>&1; then
+        _post_check_against_aws_cli || true
+    fi
+    return 0
+}
+
+_post_check_against_aws_cli() {
+    local aws_profiles ours
+    aws_profiles="$(aws configure list-profiles 2>/dev/null | LC_ALL=C sort)" || return 0
+    ours="$(
+        _run_validation quiet_collect_only 2>/dev/null
+        local i=0
+        while [[ $i -lt ${#_ALL_S_TYPE[@]} ]]; do
+            if [[ "${_ALL_S_TYPE[$i]}" == "profile" ]]; then
+                printf '%s\n' "${_ALL_S_NAME[$i]}"
+            elif [[ "${_ALL_S_TYPE[$i]}" == "default" ]]; then
+                printf 'default\n'
+            fi
+            i=$((i + 1))
+        done | LC_ALL=C sort -u
+    )"
+    if [[ "$aws_profiles" != "$ours" ]]; then
+        _warn "profile set parsed by ${PROG} differs from 'aws configure list-profiles' - possible parser bug:"
+        _warn "  aws cli sees: $(printf '%s' "$aws_profiles" | tr '\n' ' ')"
+        _warn "  ${PROG} sees: $(printf '%s' "$ours" | tr '\n' ' ')"
+    fi
+    return 0
+}
+
+# =============================================================================
+# VALIDATION (spec §9, review A4/A8/B2.3/B9/B10)
+# =============================================================================
+# _run_validation <mode>
+#   mode = "full"                run blocking + advisory rules, print all
+#   mode = "blocking"             run blocking rules only, print those
+#   mode = "quiet_collect_only"   run nothing but section/key collection,
+#                                  print nothing (used by the post-build
+#                                  aws-cli cross-check)
+# Side effects: sets _V_ERRORS, _V_WARNINGS. Also leaves the collected
+# section table in _ALL_S_TYPE[] / _ALL_S_NAME[] / _ALL_S_FILE[] /
+# _ALL_S_LINE[] for callers that want it (e.g. the post-build check).
+#
+# Design note: every counter here is a global incremented directly inside
+# the current shell - never inside a `( ... )` subshell or the read side of
+# a pipe-into-while, which is exactly the class of bug in A1.2.
+
+_V_ERRORS=0
+_V_WARNINGS=0
+_ALL_S_TYPE=()
+_ALL_S_NAME=()
+_ALL_S_FILE=()
+_ALL_S_LINE=()
+
+_require_scheme_if_strict() {
+    if [[ $STRICT -eq 1 && ! -f $SCHEME_FILE ]]; then
+        _err "--strict was given but no scheme.conf exists at $(_display_path "$SCHEME_FILE")"
+        _err "run '${PROG} init' to create one, or drop --strict"
+        return 1
+    fi
+    return 0
+}
+
+_run_validation() {
+    local mode="${1:-full}"
+    _V_ERRORS=0
+    _V_WARNINGS=0
+    _ALL_S_TYPE=(); _ALL_S_NAME=(); _ALL_S_FILE=(); _ALL_S_LINE=()
+
+    if [[ ! -d $AWSCONFD_CONFIG_DIR ]]; then
+        _err "config.d not found: $AWSCONFD_CONFIG_DIR"
+        _V_ERRORS=$((_V_ERRORS + 1))
+        return 0
+    fi
+
+    local -a frags=()
+    local f
+    while IFS= read -r f; do
+        [[ -z $f ]] && continue
+        frags+=("$f")
+    done < <(_discover_fragments "$AWSCONFD_CONFIG_DIR")
+
+    local quiet_only=0
+    [[ $mode == "quiet_collect_only" ]] && quiet_only=1
+    local blocking_only=0
+    [[ $mode == "blocking" ]] && blocking_only=1
+
+    # --- W1: fragment naming, W7: stray files (advisory only) ---
+    if [[ $quiet_only -eq 0 && $blocking_only -eq 0 ]]; then
+        for f in ${frags[@]+"${frags[@]}"}; do
+            local bn; bn="$(basename "$f")"
+            if ! _fragment_basename_ok "$bn"; then
+                _warn "W1: fragment name does not match NN-name.conf: $bn"
+                _V_WARNINGS=$((_V_WARNINGS + 1))
+            fi
+        done
+        local sf
+        for sf in "$AWSCONFD_CONFIG_DIR"/*; do
+            [[ -f $sf ]] || continue
+            local bn; bn="$(basename "$sf")"
+            case "$bn" in
+                *.conf|*.conf.disabled) continue ;;
+                .*) continue ;;
+                *)
+                    _warn "W7: config.d contains a non-fragment file: $bn"
+                    _V_WARNINGS=$((_V_WARNINGS + 1))
+                    ;;
+            esac
+        done
+    fi
+
+    # --- Collect all sections ---
+    local -a S_TYPE=() S_NAME=() S_FILE=() S_LINE=()
+    for f in ${frags[@]+"${frags[@]}"}; do
+        while IFS='|' read -r type name file line_no; do
+            S_TYPE+=("$type"); S_NAME+=("$name"); S_FILE+=("$file"); S_LINE+=("$line_no")
+            if [[ $type == "unknown" && $quiet_only -eq 0 && $blocking_only -eq 0 ]]; then
+                _warn "W4: unknown section type in $(basename "$file") line ${line_no}: [$name]"
+                _V_WARNINGS=$((_V_WARNINGS + 1))
+            fi
+        done < <(_parse_sections "$f")
+    done
+    _ALL_S_TYPE=("${S_TYPE[@]+"${S_TYPE[@]}"}")
+    _ALL_S_NAME=("${S_NAME[@]+"${S_NAME[@]}"}")
+    _ALL_S_FILE=("${S_FILE[@]+"${S_FILE[@]}"}")
+    _ALL_S_LINE=("${S_LINE[@]+"${S_LINE[@]}"}")
+    local n_sections=${#S_TYPE[@]}
+
+    if [[ $quiet_only -eq 1 ]]; then
+        return 0
+    fi
+
+    # --- B1/B2/B3: duplicate [default] / [profile x] / [sso-session y] ---
+    local i=0
+    while [[ $i -lt $n_sections ]]; do
+        local j=$((i + 1))
+        while [[ $j -lt $n_sections ]]; do
+            if [[ "${S_TYPE[$i]}" == "${S_TYPE[$j]}" && "${S_NAME[$i]}" == "${S_NAME[$j]}" ]]; then
+                case "${S_TYPE[$i]}" in
+                    default)
+                        _err "B1: duplicate [default] in $(basename "${S_FILE[$i]}") and $(basename "${S_FILE[$j]}")"
+                        _V_ERRORS=$((_V_ERRORS + 1))
+                        ;;
+                    profile)
+                        _err "B2: duplicate [profile ${S_NAME[$i]}] in $(basename "${S_FILE[$i]}") and $(basename "${S_FILE[$j]}")"
+                        _V_ERRORS=$((_V_ERRORS + 1))
+                        ;;
+                    sso-session)
+                        _err "B3: duplicate [sso-session ${S_NAME[$i]}] in $(basename "${S_FILE[$i]}") and $(basename "${S_FILE[$j]}")"
+                        _V_ERRORS=$((_V_ERRORS + 1))
+                        ;;
+                esac
+            fi
+            j=$((j + 1))
+        done
+        i=$((i + 1))
+    done
+
+    # --- Collect all top-level keys, scoped to their enclosing section ---
+    local -a K_TYPE=() K_NAME=() K_KEY=() K_VAL=() K_FILE=() K_LINE=()
+    for f in ${frags[@]+"${frags[@]}"}; do
+        while IFS='|' read -r type name key val line_no; do
+            K_TYPE+=("$type"); K_NAME+=("$name"); K_KEY+=("$key"); K_VAL+=("$val")
+            K_FILE+=("$f"); K_LINE+=("$line_no")
+        done < <(_parse_keys "$f")
+    done
+    local n_keys=${#K_TYPE[@]}
+
+    # Helper: does S_TYPE/S_NAME contain (type,name)?
+    _vh_section_defined() {
+        local want_type="$1" want_name="$2" k=0
+        while [[ $k -lt $n_sections ]]; do
+            if [[ "${S_TYPE[$k]}" == "$want_type" && "${S_NAME[$k]}" == "$want_name" ]]; then
+                return 0
+            fi
+            k=$((k + 1))
+        done
+        return 1
+    }
+    # Helper: does profile (type,name) have key=k with a non-empty value?
+    _vh_profile_has_key() {
+        local want_name="$1" want_key="$2" k=0
+        while [[ $k -lt $n_keys ]]; do
+            if [[ "${K_TYPE[$k]}" == "profile" && "${K_NAME[$k]}" == "$want_name" && "${K_KEY[$k]}" == "$want_key" && -n "${K_VAL[$k]}" ]]; then
+                return 0
+            fi
+            k=$((k + 1))
+        done
+        return 1
+    }
+
+    # --- B4/B5/B6/B7/B8: per-profile key rules ---
+    i=0
+    while [[ $i -lt $n_keys ]]; do
+        if [[ "${K_TYPE[$i]}" == "profile" ]]; then
+            local pname="${K_NAME[$i]}" pkey="${K_KEY[$i]}" pval="${K_VAL[$i]}"
+            local pfile="${K_FILE[$i]}" pline="${K_LINE[$i]}"
+
+            if [[ $pkey == "sso_session" ]]; then
+                if ! _vh_section_defined "sso-session" "$pval"; then
+                    _err "B4: $(basename "$pfile") line ${pline}: profile '${pname}' references sso_session = ${pval}, but [sso-session ${pval}] is not defined anywhere (suggest: ${PROG} add-sso ${pval})"
+                    _V_ERRORS=$((_V_ERRORS + 1))
+                fi
+                if ! _vh_profile_has_key "$pname" "sso_account_id"; then
+                    _err "B5: $(basename "$pfile") line ${pline}: profile '${pname}' has sso_session but is missing sso_account_id"
+                    _V_ERRORS=$((_V_ERRORS + 1))
+                fi
+                if ! _vh_profile_has_key "$pname" "sso_role_name"; then
+                    _err "B5: $(basename "$pfile") line ${pline}: profile '${pname}' has sso_session but is missing sso_role_name"
+                    _V_ERRORS=$((_V_ERRORS + 1))
+                fi
+                if _vh_profile_has_key "$pname" "sso_start_url"; then
+                    _err "B6: $(basename "$pfile") line ${pline}: profile '${pname}' has both sso_session and sso_start_url (legacy + modern are mutually exclusive; remove one)"
+                    _V_ERRORS=$((_V_ERRORS + 1))
+                fi
+            fi
+
+            if [[ $pkey == "role_arn" ]]; then
+                if ! _vh_profile_has_key "$pname" "source_profile" && ! _vh_profile_has_key "$pname" "credential_source"; then
+                    _err "B7: $(basename "$pfile") line ${pline}: profile '${pname}' has role_arn but neither source_profile nor credential_source"
+                    _V_ERRORS=$((_V_ERRORS + 1))
+                fi
+            fi
+
+            if [[ $pkey == "source_profile" ]]; then
+                local target="$pval" ok=1
+                if [[ $target == "default" ]]; then
+                    _vh_section_defined "default" "default" || ok=0
+                else
+                    _vh_section_defined "profile" "$target" || ok=0
+                fi
+                if [[ $ok -eq 0 ]]; then
+                    _err "B8: $(basename "$pfile") line ${pline}: profile '${pname}' has source_profile = ${target}, which is not defined"
+                    _V_ERRORS=$((_V_ERRORS + 1))
+                fi
+            fi
+        fi
+        i=$((i + 1))
+    done
+
+    if [[ $blocking_only -eq 0 ]]; then
+        # --- W3: no resolvable region ---
+        local default_region=""
+        i=0
+        while [[ $i -lt $n_keys ]]; do
+            if [[ "${K_TYPE[$i]}" == "default" && "${K_KEY[$i]}" == "region" ]]; then
+                default_region="${K_VAL[$i]}"
+            fi
+            i=$((i + 1))
+        done
+        i=0
+        while [[ $i -lt $n_sections ]]; do
+            if [[ "${S_TYPE[$i]}" == "profile" ]]; then
+                local pname="${S_NAME[$i]}"
+                if ! _vh_profile_has_key "$pname" "region" && [[ -z $default_region ]]; then
+                    _warn "W3: no region resolvable for profile '${pname}' (not in the profile or [default]; env vars may still supply it)"
+                    _V_WARNINGS=$((_V_WARNINGS + 1))
+                fi
+            fi
+            i=$((i + 1))
+        done
+
+        # --- W5: sso-session defined but unreferenced ---
+        i=0
+        while [[ $i -lt $n_sections ]]; do
+            if [[ "${S_TYPE[$i]}" == "sso-session" ]]; then
+                local sname="${S_NAME[$i]}" referenced=0 k=0
+                while [[ $k -lt $n_keys ]]; do
+                    if [[ "${K_KEY[$k]}" == "sso_session" && "${K_VAL[$k]}" == "$sname" ]]; then
+                        referenced=1; break
+                    fi
+                    k=$((k + 1))
+                done
+                if [[ $referenced -eq 0 ]]; then
+                    _warn "W5: [sso-session ${sname}] is defined but referenced by no profile"
+                    _V_WARNINGS=$((_V_WARNINGS + 1))
+                fi
+                # --- W6: sso_registration_scopes absent ---
+                local has_scopes=0 k2=0
+                while [[ $k2 -lt $n_keys ]]; do
+                    if [[ "${K_TYPE[$k2]}" == "sso-session" && "${K_NAME[$k2]}" == "$sname" && "${K_KEY[$k2]}" == "sso_registration_scopes" ]]; then
+                        has_scopes=1; break
+                    fi
+                    k2=$((k2 + 1))
+                done
+                if [[ $has_scopes -eq 0 ]]; then
+                    _warn "W6: [sso-session ${sname}] has no sso_registration_scopes (AWS defaults it, but being explicit is clearer)"
+                    _V_WARNINGS=$((_V_WARNINGS + 1))
+                fi
+            fi
+            i=$((i + 1))
+        done
+    fi
+
+    # --- B9 (overlaps) / B10+W2 (prefix outside declared ranges) ---
+    if _scheme_load; then
+        _scheme_check_overlaps
+        for f in ${frags[@]+"${frags[@]}"}; do
+            local prefix
+            if prefix="$(_prefix_of "$f")"; then
+                local label
+                if ! label="$(_scheme_label_for_prefix "$prefix")"; then
+                    if [[ $STRICT -eq 1 || $SCHEME_STRICT_DECLARED -eq 1 ]]; then
+                        _err "B10: $(basename "$f") prefix ${prefix} is outside every declared range in scheme.conf"
+                        _V_ERRORS=$((_V_ERRORS + 1))
+                    elif [[ $blocking_only -eq 0 ]]; then
+                        _warn "W2: $(basename "$f") prefix ${prefix} is outside every declared range in scheme.conf"
+                        _V_WARNINGS=$((_V_WARNINGS + 1))
+                    fi
+                fi
+            fi
+        done
+    fi
+
+    return 0
+}
+
+# =============================================================================
+# SCHEME MANIFEST (review B2)
+# =============================================================================
+# ${XDG_CONFIG_HOME:-$HOME/.config}/awsconfd/scheme.conf. Bash 3.2 has no
+# associative arrays - three parallel indexed arrays and a linear scan.
+# There will be at most a few dozen entries; this is not optimised.
+
+SCHEME_LO=()
+SCHEME_HI=()
+SCHEME_LABEL=()
+SCHEME_STRICT_DECLARED=0
+SCHEME_VERSION=""
+
+# _scheme_parse_range <spec> - sets RANGE_LO/RANGE_HI (zero-padded 2-digit
+# strings). Forms: NN (exact), Nx (decade), NN-MM (inclusive, NN<=MM).
+RANGE_LO=""
+RANGE_HI=""
+_scheme_parse_range() {
+    local spec="$1"
+    if [[ $spec =~ ^([0-9])x$ ]]; then
+        local d="${BASH_REMATCH[1]}"
+        RANGE_LO="${d}0"
+        RANGE_HI="${d}9"
+        return 0
+    fi
+    if [[ $spec =~ ^([0-9]{2})-([0-9]{2})$ ]]; then
+        RANGE_LO="${BASH_REMATCH[1]}"
+        RANGE_HI="${BASH_REMATCH[2]}"
+        [[ $((10#$RANGE_LO)) -le $((10#$RANGE_HI)) ]] || return 1
+        return 0
+    fi
+    if [[ $spec =~ ^([0-9]{2})$ ]]; then
+        RANGE_LO="${BASH_REMATCH[1]}"
+        RANGE_HI="${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+# _scheme_load - returns 1 if scheme.conf does not exist ("no scheme
+# declared" - every prefix acceptable, per B2.3).
+_scheme_load() {
+    SCHEME_LO=(); SCHEME_HI=(); SCHEME_LABEL=()
+    SCHEME_STRICT_DECLARED=0
+    SCHEME_VERSION=""
+    [[ -f $SCHEME_FILE ]] || return 1
+    local section="" line
+    while IFS= read -r line || [[ -n $line ]]; do
+        local trimmed
+        trimmed="$(_trim "$line")"
+        [[ -z $trimmed ]] && continue
+        case "${trimmed:0:1}" in '#'|';') continue ;; esac
+        if [[ $trimmed =~ ^\[(.+)\]$ ]]; then
+            section="${BASH_REMATCH[1]}"
+            continue
+        fi
+        if [[ $trimmed =~ ^([^=]+)=(.*)$ ]]; then
+            local key val
+            key="$(_trim "${BASH_REMATCH[1]}")"
+            val="$(_trim "${BASH_REMATCH[2]}")"
+            if [[ $section == "awsconfd" ]]; then
+                case "$key" in
+                    strict)
+                        case "$val" in
+                            true) SCHEME_STRICT_DECLARED=1 ;;
+                            *) SCHEME_STRICT_DECLARED=0 ;;
+                        esac
+                        ;;
+                    version) SCHEME_VERSION="$val" ;;
+                esac
+            elif [[ $section == "scheme" ]]; then
+                if _scheme_parse_range "$key"; then
+                    SCHEME_LO+=("$RANGE_LO")
+                    SCHEME_HI+=("$RANGE_HI")
+                    SCHEME_LABEL+=("$val")
+                else
+                    _warn "scheme.conf: ignoring invalid range '${key}'"
+                fi
+            fi
+        fi
+    done < "$SCHEME_FILE"
+    return 0
+}
+
+_scheme_check_overlaps() {
+    local n=${#SCHEME_LO[@]}
+    local i=0
+    while [[ $i -lt $n ]]; do
+        local j=$((i + 1))
+        while [[ $j -lt $n ]]; do
+            local lo1=$((10#${SCHEME_LO[$i]})) hi1=$((10#${SCHEME_HI[$i]}))
+            local lo2=$((10#${SCHEME_LO[$j]})) hi2=$((10#${SCHEME_HI[$j]}))
+            if [[ $lo1 -le $hi2 && $lo2 -le $hi1 ]]; then
+                _err "B9: scheme.conf ranges overlap: ${SCHEME_LO[$i]}-${SCHEME_HI[$i]} (${SCHEME_LABEL[$i]}) and ${SCHEME_LO[$j]}-${SCHEME_HI[$j]} (${SCHEME_LABEL[$j]})"
+                _V_ERRORS=$((_V_ERRORS + 1))
+            fi
+            j=$((j + 1))
+        done
+        i=$((i + 1))
+    done
+    return 0
+}
+
+_scheme_label_for_prefix() {
+    local prefix="$1" n=${#SCHEME_LO[@]} i=0
+    local p=$((10#$prefix))
+    while [[ $i -lt $n ]]; do
+        local lo=$((10#${SCHEME_LO[$i]})) hi=$((10#${SCHEME_HI[$i]}))
+        if [[ $p -ge $lo && $p -le $hi ]]; then
+            printf '%s\n' "${SCHEME_LABEL[$i]}"
+            return 0
+        fi
+        i=$((i + 1))
+    done
+    return 1
+}
+
+_scheme_range_for_label() {
+    local label="$1" n=${#SCHEME_LABEL[@]} i=0
+    while [[ $i -lt $n ]]; do
+        if [[ "${SCHEME_LABEL[$i]}" == "$label" ]]; then
+            printf '%s %s\n' "${SCHEME_LO[$i]}" "${SCHEME_HI[$i]}"
+            return 0
+        fi
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# _scheme_next_free <lo> <hi> - lowest unused two-digit prefix in [lo,hi]
+# given fragments currently in config.d. Prints "" (empty) and returns 1 if
+# full.
+_scheme_next_free() {
+    local lo="$1" hi="$2"
+    local lo_n=$((10#$lo)) hi_n=$((10#$hi))
+    local -a used=()
+    local f
+    while IFS= read -r f; do
+        [[ -z $f ]] && continue
+        used+=("$(basename "$f")")
+    done < <(_discover_fragments "$AWSCONFD_CONFIG_DIR")
+    local p=$lo_n
+    while [[ $p -le $hi_n ]]; do
+        local pp taken=0 u
+        pp="$(printf '%02d' "$p")"
+        for u in ${used[@]+"${used[@]}"}; do
+            case "$u" in
+                "${pp}"-*) taken=1; break ;;
+            esac
+        done
+        if [[ $taken -eq 0 ]]; then
+            printf '%s\n' "$pp"
+            return 0
+        fi
+        p=$((p + 1))
+    done
+    return 1
+}
+
+# Lowest unused prefix overall (00-99), ignoring the scheme - used when no
+# label/scheme applies and we still need to suggest something sensible.
+_lowest_free_prefix_overall() {
+    local -a used=()
+    local f
+    while IFS= read -r f; do
+        [[ -z $f ]] && continue
+        used+=("$(basename "$f")")
+    done < <(_discover_fragments "$AWSCONFD_CONFIG_DIR")
+    local p=0
+    while [[ $p -le 99 ]]; do
+        local pp taken=0 u
+        pp="$(printf '%02d' "$p")"
+        for u in ${used[@]+"${used[@]}"}; do
+            case "$u" in
+                "${pp}"-*) taken=1; break ;;
+            esac
+        done
+        if [[ $taken -eq 0 ]]; then
+            printf '%s\n' "$pp"
+            return 0
+        fi
+        p=$((p + 1))
+    done
+    return 1
+}
+
+_prefix_of() {
+    local bn
+    bn="$(basename "$1")"
+    if [[ $bn =~ ^([0-9]{2}) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+_write_scheme_template() {
+    local out="$1"
+    mkdir -p "$(dirname "$out")"
+    cat > "$out" << 'EOF'
+# ~/.config/awsconfd/scheme.conf
+#
+# Documents what each numeric filename prefix means. Every label and every
+# range below is an example - there are no built-in reserved ranges except
+# that `awsconfd init` seeds 00 and 10 as a convention, not a requirement.
+#
+# Range forms:
+#   NN      exactly that prefix
+#   Nx      the decade N0-N9
+#   NN-MM   inclusive range, NN <= MM
+[awsconfd]
+version = 1
+strict  = false
+
+[scheme]
+00 = defaults
+10 = sso-sessions
+EOF
+    chmod 0600 "$out"
+    return 0
+}
+
+# =============================================================================
+# INIT (spec §10.1, review A3.2/A3.3)
+# =============================================================================
+# Idempotent: every step is independently guarded on "does this already
+# exist?", not short-circuited by one early return (A3.2's bug: an
+# unconditional `cat >` was masked only by an early return on config.d
+# already existing - remove the early return without fixing the guard and
+# init destroys a populated 00-defaults.conf).
+
+cmd_init() {
+    local no_import=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-import) no_import=1; shift ;;
+            -y|--yes) ASSUME_YES=1; shift ;;
+            *) _err "init: unknown option $1"; return 2 ;;
+        esac
+    done
+
+    mkdir -p "$(dirname "$AWSCONFD_CONFIG_FILE")"
+    chmod 0700 "$(dirname "$AWSCONFD_CONFIG_FILE")" 2>/dev/null || true
+    mkdir -p "$AWSCONFD_CONFIG_DIR"
+    chmod 0700 "$AWSCONFD_CONFIG_DIR"
+    mkdir -p "$AWSCONFD_STATE_DIR"
+    chmod 0700 "$AWSCONFD_STATE_DIR"
+
+    # Import/backup: only if ~/.aws/config exists AND is not our own
+    # generated output (A3.3 - never re-import a file carrying our banner).
+    if [[ -f $AWSCONFD_CONFIG_FILE ]] && ! _is_generated_file "$AWSCONFD_CONFIG_FILE"; then
+        local backup
+        backup="$(_backup_path_for "$AWSCONFD_CONFIG_FILE")"
+        cp -p "$AWSCONFD_CONFIG_FILE" "$backup"
+        _info "backed up existing config: $(_display_path "$backup")"
+        _SKIP_BUILD_BACKUP=1
+
+        if [[ $no_import -eq 0 ]]; then
+            if [[ ! -f "${AWSCONFD_CONFIG_DIR}/99-imported.conf" ]]; then
+                {
+                    printf '# Imported by %s init from %s\n' "$PROG" "$(_display_path "$AWSCONFD_CONFIG_FILE")"
+                    printf '# on first run. Feel free to split this into separate fragments\n'
+                    printf '# (org-level [sso-session] blocks vs identity-level [profile] blocks)\n'
+                    printf '# and rename/renumber freely - awsconfd never rewrites this file\n'
+                    printf '# except through an explicit add-sso/add-profile update.\n'
+                    printf '\n'
+                    cat "$AWSCONFD_CONFIG_FILE"
+                } > "${AWSCONFD_CONFIG_DIR}/99-imported.conf"
+                chmod 0600 "${AWSCONFD_CONFIG_DIR}/99-imported.conf"
+                _info "imported existing config to: ${AWSCONFD_CONFIG_DIR}/99-imported.conf"
+            fi
+        else
+            if ! _confirm "--no-import: config.d will start empty and the next build will replace $(_display_path "$AWSCONFD_CONFIG_FILE") with a near-empty file. Continue?" 0; then
+                _err "aborted"
+                return 1
+            fi
+        fi
+    fi
+
+    if [[ ! -f "${AWSCONFD_CONFIG_DIR}/00-defaults.conf" ]]; then
+        cat > "${AWSCONFD_CONFIG_DIR}/00-defaults.conf" << 'EOF'
+# 00-defaults.conf - the [default] profile.
+#
+# There's usually little to put here: region and output are typically
+# better set per-organisation (in a profile) or per-session than globally.
+# Uncomment and edit if you do want a global fallback.
+#
+# [default]
+# region = eu-west-2
+# output = json
+EOF
+        chmod 0600 "${AWSCONFD_CONFIG_DIR}/00-defaults.conf"
+    fi
+
+    if [[ ! -f $SCHEME_FILE ]]; then
+        _write_scheme_template "$SCHEME_FILE"
+    fi
+
+    if ! cmd_build; then
+        _warn "init: build reported problems above - fix the fragments and re-run '${PROG} build'"
+    fi
+    _SKIP_BUILD_BACKUP=0
+
+    _success "initialised: $(_display_path "$AWSCONFD_CONFIG_DIR")"
+    _info "next steps:"
+    _info "  ${PROG} add-sso <name>       add an [sso-session]"
+    _info "  ${PROG} add-profile <name>   add a [profile]"
+    _info "  ${PROG} watch --install      keep ~/.aws/config in sync automatically"
+    return 0
+}
+
+# =============================================================================
+# STATUS (spec §10.8)
+# =============================================================================
+
+cmd_status() {
+    local check_mode=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --check) check_mode=1; shift ;;
+            *) _err "status: unknown option $1"; return 2 ;;
+        esac
+    done
+
+    if [[ ! -d $AWSCONFD_CONFIG_DIR ]]; then
+        if [[ $check_mode -eq 1 ]]; then
+            return 4
+        fi
+        _err "config.d not found: $AWSCONFD_CONFIG_DIR"
+        return 1
+    fi
+
+    if [[ $check_mode -eq 1 ]]; then
+        if _config_stale; then
+            return 4
+        fi
+        return 0
+    fi
+
+    printf 'config dir:    %s\n' "$(_display_path "$AWSCONFD_CONFIG_DIR")"
+    printf 'config file:   %s\n' "$(_display_path "$AWSCONFD_CONFIG_FILE")"
+    printf 'scheme:        %s\n' "$(_display_path "$SCHEME_FILE")"
+    printf '\n'
+
+    local scheme_loaded=0
+    _scheme_load && scheme_loaded=1
+
+    local -a frags=()
+    local f
+    while IFS= read -r f; do
+        [[ -z $f ]] && continue
+        frags+=("$f")
+    done < <(_discover_fragments "$AWSCONFD_CONFIG_DIR")
+
+    printf '%-28s %-6s %-16s %s\n' "FRAGMENT" "PREFIX" "SCHEME LABEL" "SECTIONS"
+    for f in ${frags[@]+"${frags[@]}"}; do
+        local bn prefix label sections
+        bn="$(basename "$f")"
+        prefix="$(_prefix_of "$f" || true)"
+        label="-"
+        if [[ $scheme_loaded -eq 1 && -n $prefix ]]; then
+            label="$(_scheme_label_for_prefix "$prefix" || true)"
+            [[ -z $label ]] && label="-"
+        fi
+        sections="$(_parse_sections "$f" | awk -F'|' '{ if ($2=="") printf "[%s] ", $1; else printf "[%s %s] ", $1, $2 }')"
+        printf '%-28s %-6s %-16s %s\n' "$bn" "${prefix:--}" "$label" "$sections"
+    done
+
+    printf '\n'
+    if _is_generated_file "$AWSCONFD_CONFIG_FILE" 2>/dev/null; then
+        printf 'generated banner:  present\n'
+    elif [[ -f $AWSCONFD_CONFIG_FILE ]]; then
+        printf 'generated banner:  ABSENT (hand-written or foreign file)\n'
+    else
+        printf 'generated banner:  n/a (no config file yet)\n'
+    fi
+
+    if _config_stale; then
+        printf 'staleness:         STALE - run: %s build\n' "$PROG"
+    else
+        printf 'staleness:         up to date\n'
+    fi
+
+    local backup_count=0 b
+    for b in "${AWSCONFD_CONFIG_FILE}".awsconfd-backup.*; do
+        [[ -f $b ]] && backup_count=$((backup_count + 1))
+    done
+    printf 'backups:           %s\n' "$backup_count"
+
+    printf '\n'
+    _watch_status_report
+    return 0
+}
+
+# =============================================================================
+# LIST (spec §10.10)
+# =============================================================================
+
+cmd_list() {
+    local subject="fragments" porcelain=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --porcelain) porcelain=1; shift ;;
+            profiles|sso-sessions|fragments) subject="$1"; shift ;;
+            *) _err "list: unknown argument $1"; return 2 ;;
+        esac
+    done
+
+    if [[ ! -d $AWSCONFD_CONFIG_DIR ]]; then
+        _err "config.d not found: $AWSCONFD_CONFIG_DIR"
+        return 1
+    fi
+
+    local -a frags=()
+    local f
+    while IFS= read -r f; do
+        [[ -z $f ]] && continue
+        frags+=("$f")
+    done < <(_discover_fragments "$AWSCONFD_CONFIG_DIR")
+
+    if [[ $subject == "fragments" ]]; then
+        for f in ${frags[@]+"${frags[@]}"}; do
+            if [[ $porcelain -eq 1 ]]; then
+                printf '%s\n' "$(basename "$f")"
+            else
+                printf '%s\n' "$(basename "$f")"
+            fi
+        done
+        return 0
+    fi
+
+    local want_type="profile"
+    [[ $subject == "sso-sessions" ]] && want_type="sso-session"
+
+    for f in ${frags[@]+"${frags[@]}"}; do
+        while IFS='|' read -r type name file line_no; do
+            [[ $type == "$want_type" ]] || continue
+            if [[ $porcelain -eq 1 ]]; then
+                printf '%s\t%s\n' "$name" "$(basename "$file")"
+            else
+                printf '%-30s %s\n' "$name" "$(basename "$file")"
+            fi
+        done < <(_parse_sections "$f")
+    done
+    return 0
+}
+
+# =============================================================================
+# DOCTOR (spec §9.1/§10.9, review A8: --fix must implement F1-F5 only, and
+# must NOT create scheme.conf - that is init's job)
+# =============================================================================
+
+cmd_doctor() {
+    local fix_mode=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --fix) fix_mode=1; shift ;;
+            *) _err "doctor: unknown option $1"; return 2 ;;
+        esac
+    done
+
+    if [[ ! -d $AWSCONFD_CONFIG_DIR ]]; then
+        _err "config.d not found: $AWSCONFD_CONFIG_DIR"
+        _err "run '${PROG} init' first"
+        return 1
+    fi
+
+    local fixed=0
+
+    if [[ $fix_mode -eq 1 ]]; then
+        local f
+        for f in "$AWSCONFD_CONFIG_DIR"/*.conf; do
+            [[ -f $f ]] || continue
+            # F1: trailing newline
+            if [[ -s $f ]] && [[ -n "$(tail -c 1 "$f")" ]]; then
+                printf '\n' >> "$f"
+                _info "F1: added trailing newline: $(basename "$f")"
+                fixed=$((fixed + 1))
+            fi
+            # F2: CRLF -> LF
+            if grep -qU $'\r' "$f" 2>/dev/null; then
+                local tmp
+                tmp="$(mktemp "${AWSCONFD_CONFIG_DIR}/.awsconfd.XXXXXX")"
+                trap 'rm -f "$tmp"' EXIT INT TERM
+                tr -d '\r' < "$f" > "$tmp"
+                chmod 0600 "$tmp"
+                mv "$tmp" "$f"
+                trap - EXIT INT TERM
+                _info "F2: converted CRLF to LF: $(basename "$f")"
+                fixed=$((fixed + 1))
+            fi
+            # F3: fragment mode 0600
+            local mode
+            mode="$(_file_mode "$f")"
+            if [[ $mode != "600" ]]; then
+                chmod 0600 "$f"
+                _info "F3: chmod 0600: $(basename "$f")"
+                fixed=$((fixed + 1))
+            fi
+        done
+        # F4: config.d mode 0700
+        local dmode
+        dmode="$(_file_mode "$AWSCONFD_CONFIG_DIR")"
+        if [[ $dmode != "700" ]]; then
+            chmod 0700 "$AWSCONFD_CONFIG_DIR"
+            _info "F4: chmod 0700 on config.d"
+            fixed=$((fixed + 1))
+        fi
+        # F5: ~/.aws/config mode 0600
+        if [[ -f $AWSCONFD_CONFIG_FILE ]]; then
+            local cmode
+            cmode="$(_file_mode "$AWSCONFD_CONFIG_FILE")"
+            if [[ $cmode != "600" ]]; then
+                chmod 0600 "$AWSCONFD_CONFIG_FILE"
+                _info "F5: chmod 0600 on $(_display_path "$AWSCONFD_CONFIG_FILE")"
+                fixed=$((fixed + 1))
+            fi
+        fi
+        if [[ $fixed -gt 0 ]]; then
+            _success "doctor --fix: applied ${fixed} fix(es)"
+        else
+            _info "doctor --fix: nothing to fix"
+        fi
+    fi
+
+    _run_validation full
+    if [[ $_V_ERRORS -gt 0 ]]; then
+        _err "doctor: ${_V_ERRORS} error(s), ${_V_WARNINGS} warning(s)"
+        return 3
+    fi
+    if [[ $_V_WARNINGS -gt 0 ]]; then
+        _info "doctor: 0 errors, ${_V_WARNINGS} warning(s)"
+    else
+        _success "all checks passed"
+    fi
+    return 0
+}
+
+# Portable file-mode-as-octal-string, without `stat -c`/`stat -f` (A2).
+_file_mode() {
+    local f="$1"
+    if command -v ls >/dev/null 2>&1; then
+        local perms
+        perms="$(ls -ld "$f" 2>/dev/null | awk '{print $1}')"
+        [[ -z $perms ]] && { printf '000\n'; return 1; }
+        _perms_to_octal "$perms"
+        return 0
+    fi
+    printf '000\n'
+    return 1
+}
+
+_perms_to_octal() {
+    local p="$1" out="" i
+    for i in 1 4 7; do
+        local triplet="${p:$i:3}" bit=0
+        [[ ${triplet:0:1} != "-" ]] && bit=$((bit + 4))
+        [[ ${triplet:1:1} != "-" ]] && bit=$((bit + 2))
+        case "${triplet:2:1}" in
+            -) : ;;
+            x|s|t) bit=$((bit + 1)) ;;
+            *) bit=$((bit + 1)) ;;
+        esac
+        out="${out}${bit}"
+    done
+    printf '%s\n' "$out"
+}
+
+# =============================================================================
+# ENABLE / DISABLE (spec §10.12, review A8: resolve name variants)
+# =============================================================================
+
+# Resolves "20", "20-a", "20-a.conf", or "20-a.conf.disabled" to the
+# fragment's basename without the .disabled suffix (i.e. the "enabled"
+# form), by matching whatever is actually on disk.
+_resolve_fragment_name() {
+    local given="$1" base="$given"
+    base="${base%.disabled}"
+    base="${base%.conf}"
+    local candidate
+    for candidate in "${AWSCONFD_CONFIG_DIR}/${base}".conf "${AWSCONFD_CONFIG_DIR}/${base}".conf.disabled; do
+        [[ -f $candidate ]] && { printf '%s\n' "$base"; return 0; }
+    done
+    # Fall back to a prefix match (e.g. "20" alone with a longer real name).
+    local f
+    for f in "$AWSCONFD_CONFIG_DIR"/"${base}"*.conf "$AWSCONFD_CONFIG_DIR"/"${base}"*.conf.disabled; do
+        [[ -f $f ]] || continue
+        local bn; bn="$(basename "$f")"
+        bn="${bn%.disabled}"
+        bn="${bn%.conf}"
+        printf '%s\n' "$bn"
+        return 0
+    done
+    return 1
+}
+
+cmd_enable() {
+    local given="${1:-}"
+    [[ -z $given ]] && { _err "usage: ${PROG} enable <fragment>"; return 2; }
+    local base
+    if ! base="$(_resolve_fragment_name "$given")"; then
+        _err "fragment not found: $given"
+        return 1
+    fi
+    local enabled="${AWSCONFD_CONFIG_DIR}/${base}.conf"
+    local disabled="${AWSCONFD_CONFIG_DIR}/${base}.conf.disabled"
+    if [[ -f $disabled ]]; then
+        mv "$disabled" "$enabled"
+        _success "enabled: ${base}.conf"
+    else
+        _info "already enabled: ${base}.conf"
+    fi
+    cmd_build
+    return 0
+}
+
+cmd_disable() {
+    local given="${1:-}"
+    [[ -z $given ]] && { _err "usage: ${PROG} disable <fragment>"; return 2; }
+    local base
+    if ! base="$(_resolve_fragment_name "$given")"; then
+        _err "fragment not found: $given"
+        return 1
+    fi
+    local enabled="${AWSCONFD_CONFIG_DIR}/${base}.conf"
+    local disabled="${AWSCONFD_CONFIG_DIR}/${base}.conf.disabled"
+    if [[ -f $enabled ]]; then
+        mv "$enabled" "$disabled"
+        _success "disabled: ${base}.conf"
+    else
+        _info "already disabled: ${base}.conf"
+    fi
+    cmd_build
+    return 0
+}
+
+# =============================================================================
+# add-sso (review B3)
+# =============================================================================
+
+readonly SSO_SESSION_CANON="sso_start_url sso_region sso_registration_scopes"
+
+_target_fragment_for_label() {
+    # Resolve the fragment that owns a scheme label: if the range holds
+    # exactly one existing fragment, use it; none -> "<lo>-<label>.conf";
+    # several -> ask (or error under --non-interactive).
+    local label="$1" default_name="$2"
+    local range
+    if ! range="$(_scheme_range_for_label "$label")"; then
+        printf '%s\n' "${AWSCONFD_CONFIG_DIR}/${default_name}"
+        return 0
+    fi
+    local lo hi
+    read -r lo hi <<< "$range"
+    local lo_n=$((10#$lo)) hi_n=$((10#$hi))
+    local -a matches=()
+    local f
+    while IFS= read -r f; do
+        [[ -z $f ]] && continue
+        local prefix
+        prefix="$(_prefix_of "$f" || true)"
+        [[ -z $prefix ]] && continue
+        local p=$((10#$prefix))
+        if [[ $p -ge $lo_n && $p -le $hi_n ]]; then
+            matches+=("$f")
+        fi
+    done < <(_discover_fragments "$AWSCONFD_CONFIG_DIR")
+
+    if [[ ${#matches[@]} -eq 0 ]]; then
+        # default_name carries the conventional filename (e.g. "10-sso.conf");
+        # re-prefix it with this range's actual lo in case the scheme moved
+        # the label to a different range than the convention assumes.
+        local suffix="${default_name#*-}"
+        printf '%s/%s-%s\n' "$AWSCONFD_CONFIG_DIR" "$lo" "$suffix"
+        return 0
+    elif [[ ${#matches[@]} -eq 1 ]]; then
+        printf '%s\n' "${matches[0]}"
+        return 0
+    else
+        if [[ $NON_INTERACTIVE -eq 1 ]]; then
+            _err "multiple fragments exist for label '${label}'; pass --file explicitly under --non-interactive"
+            return 1
+        fi
+        _warn "multiple fragments exist for label '${label}':"
+        local i=1 m
+        for m in "${matches[@]}"; do
+            _warn "  ${i}) $(basename "$m")"
+            i=$((i + 1))
+        done
+        local choice
+        choice="$(_prompt_user "which fragment?" "$(basename "${matches[0]}")")" || return 1
+        printf '%s/%s\n' "$AWSCONFD_CONFIG_DIR" "$choice"
+        return 0
+    fi
+}
+
+cmd_add_sso() {
+    local name="" start_url="" sso_region="" scopes="sso:account:access" file=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --start-url) start_url="$2"; shift 2 ;;
+            --sso-region) sso_region="$2"; shift 2 ;;
+            --scopes) scopes="$2"; shift 2 ;;
+            --file) file="$2"; shift 2 ;;
+            --non-interactive) NON_INTERACTIVE=1; shift ;;
+            -y|--yes) ASSUME_YES=1; shift ;;
+            -*) _err "add-sso: unknown option $1"; return 2 ;;
+            *) name="$1"; shift ;;
+        esac
+    done
+
+    [[ -d $AWSCONFD_CONFIG_DIR ]] || { _err "config.d not found; run '${PROG} init' first"; return 1; }
+    _scheme_load || true
+
+    if [[ -z $name ]]; then
+        name="$(_prompt_user "sso-session name" "")" || return $?
+    fi
+    [[ -z $name ]] && { _err "add-sso: a session name is required"; return 2; }
+
+    if [[ -z $start_url ]]; then
+        start_url="$(_prompt_user "sso_start_url" "")" || return $?
+    fi
+    if [[ -z $sso_region ]]; then
+        sso_region="$(_prompt_user "sso_region" "")" || return $?
+    fi
+    if [[ $NON_INTERACTIVE -eq 0 && -z ${AWSCONFD_SKIP_SCOPES_PROMPT:-} ]]; then
+        scopes="$(_prompt_user "sso_registration_scopes" "$scopes")" || return $?
+    fi
+
+    case "$start_url" in
+        https://*) ;;
+        *) _err "sso_start_url must start with https://"; return 2 ;;
+    esac
+    case "$start_url" in
+        */start) ;;
+        *) _warn "sso_start_url does not end in /start - double check it" ;;
+    esac
+    if [[ ! $sso_region =~ ^[a-z][a-z0-9-]+$ ]]; then
+        _err "sso_region '${sso_region}' does not look like a region (expected form: eu-west-2)"
+        return 2
+    fi
+
+    if [[ -z $file ]]; then
+        file="$(_target_fragment_for_label "sso-sessions" "10-sso.conf")" || return 1
+    else
+        case "$file" in
+            /*) ;;
+            *) file="${AWSCONFD_CONFIG_DIR}/${file}" ;;
+        esac
+    fi
+
+    local header="sso-session ${name}"
+    EXISTING_KEYS=(); EXISTING_VALS=()
+    local is_update=0
+    if [[ -f $file ]] && _section_exists "$file" "$header"; then
+        is_update=1
+        _load_existing_section_keys "$file" "$header"
+        _info "existing [${header}]:"
+        _section_read "$file" "$header" >&2
+    fi
+
+    RENDER_KEYS=(sso_start_url sso_region sso_registration_scopes)
+    RENDER_VALS=("$start_url" "$sso_region" "$scopes")
+
+    local body
+    body="$(mktemp "${AWSCONFD_CONFIG_DIR}/.awsconfd.XXXXXX")"
+    trap 'rm -f "$body"' EXIT INT TERM
+    _render_section "$header" "$SSO_SESSION_CANON" "$body"
+
+    if [[ $is_update -eq 1 ]]; then
+        _info "proposed [${header}]:"
+        cat "$body" >&2
+        if [[ $NON_INTERACTIVE -eq 1 && $ASSUME_YES -eq 0 ]]; then
+            rm -f "$body"
+            trap - EXIT INT TERM
+            _err "section exists; re-run with --yes to update, or --non-interactive alone will abort"
+            return 2
+        fi
+        if ! _confirm "update this section?" 0; then
+            rm -f "$body"
+            trap - EXIT INT TERM
+            _info "not updated"
+            return 0
+        fi
+    fi
+
+    mkdir -p "$(dirname "$file")"
+    _section_upsert "$file" "$header" "$body"
+    rm -f "$body"
+    trap - EXIT INT TERM
+    chmod 0600 "$file" 2>/dev/null || true
+
+    _success "wrote [${header}] to $(basename "$file")"
+    cmd_build
+    return 0
+}
+
+# =============================================================================
+# add-profile (review B4)
+# =============================================================================
+
+readonly PROFILE_SSO_CANON="sso_session sso_account_id sso_role_name region output"
+readonly PROFILE_ASSUME_CANON="role_arn source_profile credential_source mfa_serial external_id duration_seconds region output"
+readonly PROFILE_STATIC_CANON="region output"
+readonly PROFILE_PROCESS_CANON="credential_process region output"
+
+_defined_sso_sessions() {
+    local -a frags=()
+    local f
+    while IFS= read -r f; do
+        [[ -z $f ]] && continue
+        frags+=("$f")
+    done < <(_discover_fragments "$AWSCONFD_CONFIG_DIR")
+    for f in ${frags[@]+"${frags[@]}"}; do
+        while IFS='|' read -r type name file line_no; do
+            [[ $type == "sso-session" ]] && printf '%s\n' "$name"
+        done < <(_parse_sections "$f")
+    done
+    return 0
+}
+
+_defined_profiles() {
+    local -a frags=()
+    local f
+    while IFS= read -r f; do
+        [[ -z $f ]] && continue
+        frags+=("$f")
+    done < <(_discover_fragments "$AWSCONFD_CONFIG_DIR")
+    for f in ${frags[@]+"${frags[@]}"}; do
+        while IFS='|' read -r type name file line_no; do
+            [[ $type == "profile" ]] && printf '%s\n' "$name"
+        done < <(_parse_sections "$f")
+    done
+    return 0
+}
+
+_resolve_placement() {
+    # Sets PLACEMENT_FILE. Order: --file wins; else --label; else prompt
+    # with the lowest free prefix overall as the default.
+    local file_opt="$1" label_opt="$2" fallback_name="$3"
+    if [[ -n $file_opt ]]; then
+        case "$file_opt" in
+            /*) PLACEMENT_FILE="$file_opt" ;;
+            *) PLACEMENT_FILE="${AWSCONFD_CONFIG_DIR}/${file_opt}" ;;
+        esac
+        return 0
+    fi
+    if [[ -n $label_opt ]]; then
+        local range
+        if ! range="$(_scheme_range_for_label "$label_opt")"; then
+            _err "add-profile: label '${label_opt}' is not declared in scheme.conf"
+            return 1
+        fi
+        local lo hi
+        read -r lo hi <<< "$range"
+        local next
+        if ! next="$(_scheme_next_free "$lo" "$hi")"; then
+            _err "add-profile: range for label '${label_opt}' (${lo}-${hi}) is full; widen it in scheme.conf"
+            return 1
+        fi
+        if [[ $STRICT -eq 1 || $SCHEME_STRICT_DECLARED -eq 1 ]]; then
+            _info "next free prefix in '${label_opt}': ${next}"
+        fi
+        PLACEMENT_FILE="${AWSCONFD_CONFIG_DIR}/${next}-${fallback_name}.conf"
+        return 0
+    fi
+    local suggestion
+    suggestion="$(_lowest_free_prefix_overall || echo "00")"
+    local chosen
+    chosen="$(_prompt_user "filename prefix for this fragment" "$suggestion")" || return $?
+    PLACEMENT_FILE="${AWSCONFD_CONFIG_DIR}/${chosen}-${fallback_name}.conf"
+    return 0
+}
+
+cmd_add_profile() {
+    local name="" type="sso" file_opt="" label_opt=""
+    local sso_session="" sso_account_id="" sso_role_name=""
+    local role_arn="" source_profile="" credential_source="" mfa_serial="" external_id="" duration_seconds=""
+    local credential_process="" region="" output=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --type) type="$2"; shift 2 ;;
+            --file) file_opt="$2"; shift 2 ;;
+            --label) label_opt="$2"; shift 2 ;;
+            --sso-session) sso_session="$2"; shift 2 ;;
+            --sso-account-id) sso_account_id="$2"; shift 2 ;;
+            --sso-role-name) sso_role_name="$2"; shift 2 ;;
+            --role-arn) role_arn="$2"; shift 2 ;;
+            --source-profile) source_profile="$2"; shift 2 ;;
+            --credential-source) credential_source="$2"; shift 2 ;;
+            --mfa-serial) mfa_serial="$2"; shift 2 ;;
+            --external-id) external_id="$2"; shift 2 ;;
+            --duration-seconds) duration_seconds="$2"; shift 2 ;;
+            --credential-process) credential_process="$2"; shift 2 ;;
+            --region) region="$2"; shift 2 ;;
+            --output) output="$2"; shift 2 ;;
+            --non-interactive) NON_INTERACTIVE=1; shift ;;
+            -y|--yes) ASSUME_YES=1; shift ;;
+            -*) _err "add-profile: unknown option $1"; return 2 ;;
+            *) name="$1"; shift ;;
+        esac
+    done
+
+    [[ -d $AWSCONFD_CONFIG_DIR ]] || { _err "config.d not found; run '${PROG} init' first"; return 1; }
+    _scheme_load || true
+
+    if [[ -z $name ]]; then
+        name="$(_prompt_user "profile name" "")" || return $?
+    fi
+    [[ -z $name ]] && { _err "add-profile: a profile name is required"; return 2; }
+
+    case "$type" in
+        sso|assume-role|static|process) ;;
+        *) _err "add-profile: --type must be one of sso|assume-role|static|process"; return 2 ;;
+    esac
+
+    RENDER_KEYS=()
+    RENDER_VALS=()
+    local canon=""
+
+    case "$type" in
+        sso)
+            canon="$PROFILE_SSO_CANON"
+            local -a sessions=()
+            local s
+            while IFS= read -r s; do [[ -n $s ]] && sessions+=("$s"); done < <(_defined_sso_sessions)
+            if [[ ${#sessions[@]} -eq 0 ]]; then
+                if [[ $NON_INTERACTIVE -eq 1 ]]; then
+                    _err "B4: no [sso-session] blocks defined; run '${PROG} add-sso' first"
+                    return 3
+                fi
+                _warn "no [sso-session] blocks defined yet"
+                if _confirm "run add-sso now?" 1; then
+                    cmd_add_sso || return $?
+                    sessions=()
+                    while IFS= read -r s; do [[ -n $s ]] && sessions+=("$s"); done < <(_defined_sso_sessions)
+                fi
+            fi
+            if [[ -z $sso_session ]]; then
+                local hint=""
+                [[ ${#sessions[@]} -gt 0 ]] && hint="${sessions[0]}"
+                _info "known sso-sessions: ${sessions[*]+"${sessions[*]}"}"
+                sso_session="$(_prompt_user "sso_session" "$hint")" || return $?
+            fi
+            if [[ -z $sso_account_id ]]; then
+                sso_account_id="$(_prompt_user "sso_account_id" "")" || return $?
+            fi
+            if [[ -z $sso_role_name ]]; then
+                sso_role_name="$(_prompt_user "sso_role_name" "")" || return $?
+            fi
+            if [[ ! $sso_account_id =~ ^[0-9]{12}$ ]]; then
+                _err "sso_account_id must be exactly 12 digits"
+                return 2
+            fi
+            [[ -z $sso_role_name ]] && { _err "sso_role_name is required"; return 2; }
+            RENDER_KEYS+=(sso_session sso_account_id sso_role_name)
+            RENDER_VALS+=("$sso_session" "$sso_account_id" "$sso_role_name")
+            ;;
+        assume-role)
+            canon="$PROFILE_ASSUME_CANON"
+            if [[ -z $role_arn ]]; then
+                role_arn="$(_prompt_user "role_arn" "")" || return $?
+            fi
+            if [[ ! $role_arn =~ ^arn:aws[a-z-]*:iam::[0-9]{12}:role/ ]]; then
+                _err "role_arn does not look like an IAM role ARN"
+                return 2
+            fi
+            if [[ -z $source_profile && -z $credential_source ]]; then
+                source_profile="$(_prompt_user "source_profile (leave blank to use credential_source instead)" "")" || return $?
+                if [[ -z $source_profile ]]; then
+                    credential_source="$(_prompt_user "credential_source (Environment|Ec2InstanceMetadata|EcsContainer)" "")" || return $?
+                fi
+            fi
+            if [[ -n $source_profile && -n $credential_source ]]; then
+                _err "specify exactly one of source_profile / credential_source, not both"
+                return 2
+            fi
+            if [[ -z $source_profile && -z $credential_source ]]; then
+                _err "one of source_profile / credential_source is required"
+                return 2
+            fi
+            if [[ -n $credential_source ]]; then
+                case "$credential_source" in
+                    Environment|Ec2InstanceMetadata|EcsContainer) ;;
+                    *) _err "credential_source must be one of Environment|Ec2InstanceMetadata|EcsContainer"; return 2 ;;
+                esac
+            fi
+            if [[ -n $source_profile ]]; then
+                if [[ $source_profile != "default" ]]; then
+                    local ok=0 p
+                    while IFS= read -r p; do
+                        [[ "$p" == "$source_profile" ]] && ok=1 && break
+                    done < <(_defined_profiles)
+                    if [[ $ok -eq 0 ]]; then
+                        _err "B8: source_profile '${source_profile}' is not a defined profile"
+                        return 3
+                    fi
+                fi
+            fi
+            RENDER_KEYS+=(role_arn)
+            RENDER_VALS+=("$role_arn")
+            if [[ -n $source_profile ]]; then
+                RENDER_KEYS+=(source_profile); RENDER_VALS+=("$source_profile")
+            fi
+            if [[ -n $credential_source ]]; then
+                RENDER_KEYS+=(credential_source); RENDER_VALS+=("$credential_source")
+            fi
+            [[ -n $mfa_serial ]] && { RENDER_KEYS+=(mfa_serial); RENDER_VALS+=("$mfa_serial"); }
+            [[ -n $external_id ]] && { RENDER_KEYS+=(external_id); RENDER_VALS+=("$external_id"); }
+            [[ -n $duration_seconds ]] && { RENDER_KEYS+=(duration_seconds); RENDER_VALS+=("$duration_seconds"); }
+            ;;
+        static)
+            canon="$PROFILE_STATIC_CANON"
+            _info "static profiles reference a name in ~/.aws/credentials, which ${PROG} never reads or writes."
+            _info "only region/output are written here; the credentials themselves live in ~/.aws/credentials."
+            local cred_name
+            cred_name="$(_prompt_user "name of the profile in ~/.aws/credentials (informational only, not written)" "$name")" || return $?
+            _verbose "static profile references credentials-file entry: $cred_name"
+            ;;
+        process)
+            canon="$PROFILE_PROCESS_CANON"
+            if [[ -z $credential_process ]]; then
+                credential_process="$(_prompt_user "credential_process command" "")" || return $?
+            fi
+            [[ -z $credential_process ]] && { _err "credential_process is required"; return 2; }
+            _warn "credential_process may embed a secret; the fragment is mode 0600 but not encrypted"
+            RENDER_KEYS+=(credential_process)
+            RENDER_VALS+=("$credential_process")
+            ;;
+    esac
+
+    if [[ -z $region ]]; then
+        region="$(_prompt_user "region" "")" || return $?
+    fi
+    if [[ -z $output ]]; then
+        output="$(_prompt_user "output" "json")" || return $?
+    fi
+    [[ -n $region ]] && { RENDER_KEYS+=(region); RENDER_VALS+=("$region"); }
+    [[ -n $output ]] && { RENDER_KEYS+=(output); RENDER_VALS+=("$output"); }
+
+    if ! _resolve_placement "$file_opt" "$label_opt" "$name"; then
+        return 1
+    fi
+
+    local header="profile ${name}"
+    EXISTING_KEYS=(); EXISTING_VALS=()
+    local is_update=0
+    if [[ -f $PLACEMENT_FILE ]] && _section_exists "$PLACEMENT_FILE" "$header"; then
+        is_update=1
+        _load_existing_section_keys "$PLACEMENT_FILE" "$header"
+        _info "existing [${header}]:"
+        _section_read "$PLACEMENT_FILE" "$header" >&2
+    fi
+
+    local body
+    body="$(mktemp "${AWSCONFD_CONFIG_DIR}/.awsconfd.XXXXXX")"
+    trap 'rm -f "$body"' EXIT INT TERM
+    _render_section "$header" "$canon" "$body"
+
+    if [[ $is_update -eq 1 ]]; then
+        _info "proposed [${header}]:"
+        cat "$body" >&2
+        if [[ $NON_INTERACTIVE -eq 1 && $ASSUME_YES -eq 0 ]]; then
+            rm -f "$body"; trap - EXIT INT TERM
+            _err "section exists; re-run with --yes to update"
+            return 2
+        fi
+        if ! _confirm "update this section?" 0; then
+            rm -f "$body"; trap - EXIT INT TERM
+            _info "not updated"
+            return 0
+        fi
+    fi
+
+    mkdir -p "$(dirname "$PLACEMENT_FILE")"
+    _section_upsert "$PLACEMENT_FILE" "$header" "$body"
+    rm -f "$body"
+    trap - EXIT INT TERM
+    chmod 0600 "$PLACEMENT_FILE" 2>/dev/null || true
+
+    _success "wrote [${header}] to $(basename "$PLACEMENT_FILE")"
+    cmd_build
+    return 0
+}
+
+# =============================================================================
+# apply --spec (review B5)
+# =============================================================================
+# Applies a spec file transactionally: stage config.d in a mktemp -d
+# directory, apply there, validate there, and only then move the changed
+# fragments into place. Partial application is worse than no application.
+
+_spec_infer_label_for_type() {
+    case "$1" in
+        sso-session) printf 'sso-sessions\n' ;;
+        profile) printf 'profile\n' ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+    return 0
+}
+
+cmd_apply() {
+    local spec="" force=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --spec) spec="$2"; shift 2 ;;
+            --force) force=1; shift ;;
+            --dry-run) DRY_RUN=1; shift ;;
+            --strict) STRICT=1; shift ;;
+            *) _err "apply: unknown option $1"; return 2 ;;
+        esac
+    done
+    [[ -z $spec ]] && { _err "usage: ${PROG} apply --spec FILE|-"; return 2; }
+
+    local spec_file="$spec"
+    if [[ $spec == "-" ]]; then
+        spec_file="$(mktemp "${TMPDIR:-/tmp}/.awsconfd-spec.XXXXXX")"
+        cat > "$spec_file"
+    fi
+    [[ -f $spec_file ]] || { _err "spec file not found: $spec_file"; return 1; }
+
+    [[ -d $AWSCONFD_CONFIG_DIR ]] || { _err "config.d not found; run '${PROG} init' first"; return 1; }
+
+    # --- Parse [awsconfd] / [awsconfd:scheme] / [awsconfd:layout] plus
+    #     payload sections, in file order. ---
+    local ctl_version="" ctl_strict=""
+    local -a scheme_lines=()
+    local -a layout_keys=() layout_vals=()
+    local -a payload_headers=()
+    local -a payload_starts=() payload_ends=()
+
+    _read_lines_into_array "$spec_file"
+    local -a SPEC_LINES=("${LINES[@]+"${LINES[@]}"}")
+    local n=${#SPEC_LINES[@]}
+    local i=1 section=""
+    local -a section_starts=() section_names=() section_kinds=()
+    while [[ $i -le $n ]]; do
+        local line="${SPEC_LINES[$((i - 1))]}"
+        if _is_header_line "$line"; then
+            section="$HDR_CONTENT"
+            section_starts+=("$i")
+            section_names+=("$section")
+        fi
+        i=$((i + 1))
+    done
+
+    local sc=${#section_names[@]}
+    local idx=0
+    while [[ $idx -lt $sc ]]; do
+        local sname="${section_names[$idx]}"
+        local sstart="${section_starts[$idx]}"
+        local send=$n
+        if [[ $((idx + 1)) -lt $sc ]]; then
+            send=$(( ${section_starts[$((idx+1))]} - 1 ))
+        fi
+        case "$sname" in
+            awsconfd)
+                local j=$((sstart + 1))
+                while [[ $j -le $send ]]; do
+                    local l="${SPEC_LINES[$((j - 1))]}" t
+                    t="$(_trim "$l")"
+                    if [[ $t =~ ^([^=]+)=(.*)$ ]]; then
+                        local k v
+                        k="$(_trim "${BASH_REMATCH[1]}")"; v="$(_trim "${BASH_REMATCH[2]}")"
+                        [[ $k == "version" ]] && ctl_version="$v"
+                        [[ $k == "strict" ]] && ctl_strict="$v"
+                    fi
+                    j=$((j + 1))
+                done
+                ;;
+            awsconfd:scheme)
+                local j=$((sstart + 1))
+                while [[ $j -le $send ]]; do
+                    scheme_lines+=("${SPEC_LINES[$((j - 1))]}")
+                    j=$((j + 1))
+                done
+                ;;
+            awsconfd:layout)
+                local j=$((sstart + 1))
+                while [[ $j -le $send ]]; do
+                    local l="${SPEC_LINES[$((j - 1))]}" t
+                    t="$(_trim "$l")"
+                    [[ -z $t ]] && { j=$((j + 1)); continue; }
+                    case "${t:0:1}" in '#'|';') j=$((j + 1)); continue ;; esac
+                    if [[ $t =~ ^([^=]+)=(.*)$ ]]; then
+                        layout_keys+=("$(_trim "${BASH_REMATCH[1]}")")
+                        layout_vals+=("$(_trim "${BASH_REMATCH[2]}")")
+                    fi
+                    j=$((j + 1))
+                done
+                ;;
+            *)
+                # Trim trailing blank/comment lines (mirrors _section_extent's
+                # own end rule) so a section's captured body doesn't include
+                # blank lines that belonged only to the spec file's layout,
+                # which would otherwise accumulate when several spec sections
+                # land in the same target fragment.
+                local trimmed_send=$send
+                while [[ $trimmed_send -gt $sstart ]]; do
+                    local tl
+                    tl="$(_trim "${SPEC_LINES[$((trimmed_send - 1))]}")"
+                    if [[ -z $tl ]]; then
+                        trimmed_send=$((trimmed_send - 1))
+                        continue
+                    fi
+                    case "${tl:0:1}" in
+                        '#'|';') trimmed_send=$((trimmed_send - 1)); continue ;;
+                    esac
+                    break
+                done
+                payload_headers+=("$sname")
+                payload_starts+=("$sstart")
+                payload_ends+=("$trimmed_send")
+                ;;
+        esac
+        idx=$((idx + 1))
+    done
+
+    if [[ -n $ctl_version && $ctl_version != "1" ]]; then
+        _err "apply: spec version ${ctl_version} is not supported (expected 1)"
+        return 2
+    fi
+
+    # --- Stage config.d in a temp dir; apply there; validate there. ---
+    local stage
+    stage="$(mktemp -d "${TMPDIR:-/tmp}/.awsconfd-stage.XXXXXX")"
+    trap 'rm -rf "$stage"' EXIT INT TERM
+    local f
+    for f in "$AWSCONFD_CONFIG_DIR"/*.conf; do
+        [[ -f $f ]] && cp -p "$f" "$stage/"
+    done
+
+    # scheme.conf: write only if absent, unless --force (with confirmation).
+    if [[ ${#scheme_lines[@]} -gt 0 ]]; then
+        if [[ ! -f $SCHEME_FILE ]]; then
+            {
+                printf '[awsconfd]\nversion = 1\nstrict  = false\n\n[scheme]\n'
+                local sl
+                for sl in "${scheme_lines[@]}"; do printf '%s\n' "$sl"; done
+            } > "$SCHEME_FILE"
+            chmod 0600 "$SCHEME_FILE"
+            _info "wrote scheme.conf from spec"
+        else
+            _warn "scheme.conf already exists; spec's [awsconfd:scheme] was not applied (use --force to overwrite)"
+            if [[ $force -eq 1 ]] && _confirm "overwrite existing scheme.conf with the spec's [awsconfd:scheme]?" 0; then
+                {
+                    printf '[awsconfd]\nversion = 1\nstrict  = false\n\n[scheme]\n'
+                    local sl
+                    for sl in "${scheme_lines[@]}"; do printf '%s\n' "$sl"; done
+                } > "$SCHEME_FILE"
+                chmod 0600 "$SCHEME_FILE"
+                _info "overwrote scheme.conf from spec"
+            fi
+        fi
+    fi
+    _scheme_load || true
+
+    local p=0 pn=${#payload_headers[@]}
+    local -a plan_lines=()
+    while [[ $p -lt $pn ]]; do
+        local header="${payload_headers[$p]}" pstart="${payload_starts[$p]}" pend="${payload_ends[$p]}"
+        _classify_header "$header"
+        local ptype="$HDR_TYPE"
+
+        # target: layout entry wins
+        local target=""
+        local li=0
+        while [[ $li -lt ${#layout_keys[@]} ]]; do
+            [[ "${layout_keys[$li]}" == "$header" ]] && { target="${layout_vals[$li]}"; break; }
+            li=$((li + 1))
+        done
+
+        local inferred=0
+        if [[ -z $target ]]; then
+            inferred=1
+            local label
+            label="$(_spec_infer_label_for_type "$ptype")"
+            local range
+            if range="$(_scheme_range_for_label "$label")"; then
+                local lo hi; read -r lo hi <<< "$range"
+                local free
+                if free="$(_scheme_next_free "$lo" "$hi")"; then
+                    target="${free}-${label}.conf"
+                fi
+            fi
+            if [[ -z $target ]]; then
+                local free2
+                free2="$(_lowest_free_prefix_overall || echo "00")"
+                target="${free2}-${ptype}.conf"
+            fi
+            _warn "W2: [${header}] has no [awsconfd:layout] entry; placed by scheme as ${target}"
+        fi
+
+        local target_path="${stage}/${target}"
+
+        # Already exists in ANY staged fragment?
+        local existing_file="" ef
+        for ef in "$stage"/*.conf; do
+            [[ -f $ef ]] || continue
+            if _section_exists "$ef" "$header"; then
+                existing_file="$ef"
+                break
+            fi
+        done
+
+        if [[ -n $existing_file && $force -eq 0 ]]; then
+            plan_lines+=("SKIP [${header}] (already in $(basename "$existing_file"))")
+            p=$((p + 1))
+            continue
+        fi
+
+        local body
+        body="$(mktemp "${stage}/.awsconfd.XXXXXX")"
+        local li2=$pstart
+        : > "$body"
+        while [[ $li2 -le $pend ]]; do
+            printf '%s\n' "${SPEC_LINES[$((li2 - 1))]}" >> "$body"
+            li2=$((li2 + 1))
+        done
+
+        if [[ -n $existing_file ]]; then
+            # --force: upsert into its existing fragment, not the inferred/layout target.
+            plan_lines+=("UPDATE [${header}] in $(basename "$existing_file")")
+            if [[ $DRY_RUN -eq 0 ]]; then
+                _section_upsert "$existing_file" "$header" "$body"
+                chmod 0600 "$existing_file"
+            fi
+        else
+            plan_lines+=("CREATE [${header}] in $(basename "$target_path")")
+            if [[ $DRY_RUN -eq 0 ]]; then
+                _section_upsert "$target_path" "$header" "$body"
+                chmod 0600 "$target_path"
+            fi
+        fi
+        rm -f "$body"
+        p=$((p + 1))
+    done
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        local pl
+        for pl in ${plan_lines[@]+"${plan_lines[@]}"}; do
+            printf '%s\n' "$pl"
+        done
+        rm -rf "$stage"
+        trap - EXIT INT TERM
+        return 0
+    fi
+
+    # Validate the staged directory before touching the real one.
+    local real_dir="$AWSCONFD_CONFIG_DIR"
+    AWSCONFD_CONFIG_DIR="$stage"
+    _run_validation blocking
+    local verrs=$_V_ERRORS
+    AWSCONFD_CONFIG_DIR="$real_dir"
+
+    if [[ $verrs -gt 0 ]]; then
+        _err "apply: staged result fails validation; config.d left unchanged"
+        rm -rf "$stage"
+        trap - EXIT INT TERM
+        return 3
+    fi
+
+    local pl
+    for pl in ${plan_lines[@]+"${plan_lines[@]}"}; do
+        _info "$pl"
+    done
+
+    # Commit: copy every fragment from stage over the real directory.
+    for f in "$stage"/*.conf; do
+        [[ -f $f ]] || continue
+        cp -p "$f" "$AWSCONFD_CONFIG_DIR/"
+        chmod 0600 "${AWSCONFD_CONFIG_DIR}/$(basename "$f")"
+    done
+    rm -rf "$stage"
+    trap - EXIT INT TERM
+
+    [[ $spec == "-" ]] && rm -f "$spec_file"
+
+    _success "apply: spec applied"
+    cmd_build
+    return 0
+}
+
+# =============================================================================
+# hook (review B7) - Layer 3: rebuild, cheaply, at every prompt
+# =============================================================================
+# Bash builtins only (`[[ a -nt b ]]`) - forks zero processes in the common
+# case where nothing is stale. awsconfd itself is only ever invoked when a
+# rebuild is actually needed.
+
+cmd_hook() {
+    local shell="${1:-}"
+    [[ -z $shell ]] && { _err "usage: ${PROG} hook bash|zsh"; return 2; }
+
+    case "$shell" in
+        bash)
+            cat << 'HOOK_EOF'
+# awsconfd integration for bash - Layer 3 (rebuild at every prompt, cheaply)
+_awsconfd_stale() {
+    local d="${AWSCONFD_CONFIG_DIR:-$HOME/.aws/config.d}"
+    local c="${AWS_CONFIG_FILE:-$HOME/.aws/config}"
+    [[ -n ${AWSCONFD_HOOK_DISABLE:-} ]] && return 1
+    [[ -d $d ]] || return 1
+    [[ -f $c ]] || return 0
+    [[ $d -nt $c ]] && return 0
+    local f
+    for f in "$d"/*.conf; do
+        [[ -e $f ]] || continue
+        [[ $f -nt $c ]] && return 0
+    done
+    return 1
+}
+_awsconfd_hook() { _awsconfd_stale && awsconfd build --quiet; return 0; }
+case "${PROMPT_COMMAND:-}" in
+    *_awsconfd_hook*) ;;
+    "")  PROMPT_COMMAND="_awsconfd_hook" ;;
+    *)   PROMPT_COMMAND="${PROMPT_COMMAND%;};_awsconfd_hook" ;;
+esac
+HOOK_EOF
+            ;;
+        zsh)
+            cat << 'HOOK_EOF'
+# awsconfd integration for zsh - Layer 3 (rebuild at every prompt, cheaply)
+_awsconfd_stale() {
+    local d="${AWSCONFD_CONFIG_DIR:-$HOME/.aws/config.d}"
+    local c="${AWS_CONFIG_FILE:-$HOME/.aws/config}"
+    [[ -n ${AWSCONFD_HOOK_DISABLE:-} ]] && return 1
+    [[ -d $d ]] || return 1
+    [[ -f $c ]] || return 0
+    [[ $d -nt $c ]] && return 0
+    local f
+    for f in "$d"/*.conf; do
+        [[ -e $f ]] || continue
+        [[ $f -nt $c ]] && return 0
+    done
+    return 1
+}
+_awsconfd_hook() { _awsconfd_stale && awsconfd build --quiet; return 0; }
+autoload -Uz add-zsh-hook 2>/dev/null && add-zsh-hook precmd _awsconfd_hook \
+  || precmd_functions+=(_awsconfd_hook)
+HOOK_EOF
+            ;;
+        *)
+            _err "hook: unknown shell '$shell' (expected bash or zsh)"
+            return 2
+            ;;
+    esac
+    return 0
+}
+
+# =============================================================================
+# watch (review B6) - the watcher is a latency optimisation; the staleness
+# check above is the correctness backstop. `build` is always available
+# manually. Nothing is ever load-bearing on the watcher.
+# =============================================================================
+
+# All actual systemctl/launchctl invocations go through these two wrappers
+# so the test suite can stub them (B6.7).
+_systemctl() { command systemctl "$@"; }
+_launchctl() { command launchctl "$@"; }
+
+readonly WATCH_UNIT_SENTINEL="# managed-by: awsconfd"
+
+_detect_init_system() {
+    if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]] && command -v launchctl >/dev/null 2>&1; then
+        printf 'launchd\n'
+        return 0
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        if [[ -S "${XDG_RUNTIME_DIR:-}/systemd/private" ]]; then
+            printf 'systemd\n'
+            return 0
+        fi
+        local out
+        out="$(_systemctl --user is-system-running 2>&1)" || true
+        # "running"/"degraded" mean a live, dbus-connected user manager.
+        # Everything else - "offline" (no session bus at all, the common
+        # container/minimal-server case), a connection failure, or no
+        # systemctl binary reachable via --user - is not usable and must
+        # fall through to Layer 3, per spec's explicit "containers...land
+        # here" guidance.
+        case "$out" in
+            running|degraded)
+                printf 'systemd\n'
+                return 0
+                ;;
+        esac
+    fi
+    printf 'none\n'
+    return 0
+}
+
+_systemd_unit_dir() { printf '%s/systemd/user\n' "$XDG_CONFIG_HOME"; }
+_launchd_plist_path() { printf '%s/Library/LaunchAgents/com.GingerGraham.awsconfd.plist\n' "$HOME"; }
+
+cmd_watch() {
+    local install=0 uninstall=0 status=0 with_timer=0 interval=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --install) install=1; shift ;;
+            --uninstall) uninstall=1; shift ;;
+            --status) status=1; shift ;;
+            --with-timer) with_timer=1; shift ;;
+            --interval) interval="$2"; shift 2 ;;
+            *) _err "watch: unknown option $1"; return 2 ;;
+        esac
+    done
+
+    if [[ $install -eq 1 ]]; then
+        _watch_install "$with_timer" "$interval"
+        return $?
+    elif [[ $uninstall -eq 1 ]]; then
+        _watch_uninstall
+        return $?
+    elif [[ $status -eq 1 ]]; then
+        _watch_status_report
+        return 0
+    else
+        _err "usage: ${PROG} watch --install|--uninstall|--status [--with-timer] [--interval SPEC]"
+        return 2
+    fi
+}
+
+_watch_install() {
+    local with_timer="$1" interval="$2"
+    local init_sys
+    init_sys="$(_detect_init_system)"
+
+    if [[ $init_sys == "none" ]]; then
+        _info "no systemd user manager or launchd found; nothing installed"
+        _info "the correctness backstop still works everywhere: eval \"\$(${PROG} hook bash)\" (or hook zsh)"
+        _info "and '${PROG} build' is always safe to run manually or from cron"
+        return 0
+    fi
+
+    local self
+    if ! self="$(_self_path)"; then
+        _err "could not resolve an absolute path for this script; refusing to install a unit with a relative ExecStart"
+        return 1
+    fi
+    [[ -x $self ]] || { _err "resolved path is not executable: $self"; return 1; }
+    local sleep_path
+    sleep_path="$(command -v sleep 2>/dev/null || true)"
+    [[ -z $sleep_path ]] && sleep_path="sleep"
+
+    if [[ $init_sys == "systemd" ]]; then
+        _watch_install_systemd "$self" "$sleep_path" "$with_timer" "$interval"
+    else
+        _watch_install_launchd "$self" "$with_timer" "$interval"
+    fi
+    return $?
+}
+
+_watch_install_systemd() {
+    local self="$1" sleep_path="$2" with_timer="$3" interval="$4"
+    local dir; dir="$(_systemd_unit_dir)"
+    mkdir -p "$dir"
+
+    local svc="${dir}/awsconfd-build.service"
+    local path_unit="${dir}/awsconfd-build.path"
+    local timer="${dir}/awsconfd-build.timer"
+
+    local svc_content path_content
+    svc_content="$(cat << EOF
+${WATCH_UNIT_SENTINEL}
+[Unit]
+Description=Rebuild ~/.aws/config from ~/.aws/config.d
+Documentation=https://github.com/GingerGraham/awsconfd
+
+[Service]
+Type=oneshot
+ExecStartPre=${sleep_path} 0.5
+ExecStart=${self} build --quiet
+Nice=10
+
+[Install]
+WantedBy=default.target
+EOF
+)"
+    path_content="$(cat << EOF
+${WATCH_UNIT_SENTINEL}
+[Unit]
+Description=Watch ${AWSCONFD_CONFIG_DIR} for changes
+Documentation=https://github.com/GingerGraham/awsconfd
+
+[Path]
+PathChanged=${AWSCONFD_CONFIG_DIR}
+Unit=awsconfd-build.service
+
+[Install]
+WantedBy=default.target
+EOF
+)"
+
+    local changed=0
+    if [[ ! -f $svc || "$(cat "$svc" 2>/dev/null)" != "$svc_content" ]]; then
+        printf '%s\n' "$svc_content" > "$svc"
+        changed=1
+    fi
+    if [[ ! -f $path_unit || "$(cat "$path_unit" 2>/dev/null)" != "$path_content" ]]; then
+        printf '%s\n' "$path_content" > "$path_unit"
+        changed=1
+    fi
+
+    if [[ $with_timer -eq 1 ]]; then
+        local cal="${interval:-hourly}"
+        local timer_content
+        timer_content="$(cat << EOF
+${WATCH_UNIT_SENTINEL}
+[Unit]
+Description=Periodic safety-net rebuild of ~/.aws/config
+Documentation=https://github.com/GingerGraham/awsconfd
+
+[Timer]
+OnCalendar=${cal}
+Persistent=true
+
+[Install]
+WantedBy=default.target
+EOF
+)"
+        if [[ ! -f $timer || "$(cat "$timer" 2>/dev/null)" != "$timer_content" ]]; then
+            printf '%s\n' "$timer_content" > "$timer"
+            changed=1
+        fi
+    fi
+
+    if [[ $changed -eq 0 ]]; then
+        _info "watch --install: units already up to date, nothing to do"
+        return 0
+    fi
+
+    _systemctl --user daemon-reload
+    _systemctl --user enable --now awsconfd-build.path awsconfd-build.service
+    [[ $with_timer -eq 1 ]] && _systemctl --user enable --now awsconfd-build.timer
+
+    _success "installed systemd user units in $(_display_path "$dir")"
+    _info "headless/never-logged-in host? run: loginctl enable-linger \$USER"
+    return 0
+}
+
+_watch_install_launchd() {
+    local self="$1" with_timer="$2" interval="$3"
+    local plist; plist="$(_launchd_plist_path)"
+    mkdir -p "$(dirname "$plist")"
+
+    local interval_xml=""
+    if [[ $with_timer -eq 1 ]]; then
+        local secs="${interval:-3600}"
+        interval_xml="    <key>StartInterval</key><integer>${secs}</integer>
+"
+    fi
+
+    local content
+    content="$(cat << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- ${WATCH_UNIT_SENTINEL} -->
+    <key>Label</key><string>com.GingerGraham.awsconfd</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${self}</string>
+        <string>build</string>
+        <string>--quiet</string>
+    </array>
+    <key>WatchPaths</key>
+    <array><string>${AWSCONFD_CONFIG_DIR}</string></array>
+    <key>RunAtLoad</key><true/>
+${interval_xml}</dict>
+</plist>
+EOF
+)"
+
+    if [[ -f $plist ]] && [[ "$(cat "$plist")" == "$content" ]]; then
+        _info "watch --install: plist already up to date, nothing to do"
+        return 0
+    fi
+
+    printf '%s\n' "$content" > "$plist"
+    _launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null || _launchctl load -w "$plist" 2>/dev/null || true
+
+    _success "installed launchd agent: $(_display_path "$plist")"
+    _warn "WatchPaths fires reliably on directory-mtime changes (create/delete/rename)."
+    _warn "an in-place append may not fire it. Recommended: eval \"\$(${PROG} hook zsh)\" (or hook bash) in your shell rc."
+    return 0
+}
+
+_watch_uninstall() {
+    local init_sys
+    init_sys="$(_detect_init_system)"
+    local removed=0
+
+    local dir; dir="$(_systemd_unit_dir)"
+    local u
+    for u in "${dir}/awsconfd-build.service" "${dir}/awsconfd-build.path" "${dir}/awsconfd-build.timer"; do
+        [[ -f $u ]] || continue
+        if ! grep -qF "$WATCH_UNIT_SENTINEL" "$u" 2>/dev/null; then
+            _warn "not removing $(basename "$u") - it wasn't written by ${PROG} (no sentinel)"
+            continue
+        fi
+        removed=1
+    done
+    if [[ $removed -eq 1 && $init_sys == "systemd" ]]; then
+        _systemctl --user disable --now awsconfd-build.path awsconfd-build.service awsconfd-build.timer 2>/dev/null || true
+    fi
+    if [[ $removed -eq 1 ]]; then
+        rm -f "${dir}/awsconfd-build.service" "${dir}/awsconfd-build.path" "${dir}/awsconfd-build.timer"
+        [[ $init_sys == "systemd" ]] && _systemctl --user daemon-reload 2>/dev/null || true
+        _success "removed systemd units from $(_display_path "$dir")"
+    fi
+
+    local plist; plist="$(_launchd_plist_path)"
+    if [[ -f $plist ]]; then
+        if grep -qF "$WATCH_UNIT_SENTINEL" "$plist" 2>/dev/null; then
+            _launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || _launchctl unload -w "$plist" 2>/dev/null || true
+            rm -f "$plist"
+            _success "removed launchd agent: $(_display_path "$plist")"
+            removed=1
+        else
+            _warn "not removing $(basename "$plist") - it wasn't written by ${PROG} (no sentinel)"
+        fi
+    fi
+
+    if [[ $removed -eq 0 ]]; then
+        _info "nothing installed to remove"
+    fi
+    return 0
+}
+
+_watch_status_report() {
+    local init_sys
+    init_sys="$(_detect_init_system)"
+    printf 'watcher init system:  %s\n' "$init_sys"
+
+    if [[ $init_sys == "systemd" ]]; then
+        local dir; dir="$(_systemd_unit_dir)"
+        local u
+        for u in "${dir}/awsconfd-build.service" "${dir}/awsconfd-build.path" "${dir}/awsconfd-build.timer"; do
+            [[ -f $u ]] || continue
+            local bn; bn="$(basename "$u")"
+            local enabled="unknown"
+            enabled="$(_systemctl --user is-enabled "$bn" 2>/dev/null || echo "unknown")"
+            printf '  %-28s installed, enabled=%s\n' "$bn" "$enabled"
+            local exec_line exec_path
+            exec_line="$(grep '^ExecStart=' "$u" 2>/dev/null | head -1)"
+            exec_path="${exec_line#ExecStart=}"
+            exec_path="${exec_path%% *}"
+            if [[ -n $exec_path && ! -x $exec_path ]]; then
+                _warn "  ${bn}: ExecStart path is missing or not executable: ${exec_path}"
+            fi
+            local watched
+            watched="$(grep '^PathChanged=' "$u" 2>/dev/null | head -1)"
+            watched="${watched#PathChanged=}"
+            if [[ -n $watched && $watched != "$AWSCONFD_CONFIG_DIR" ]]; then
+                _warn "  ${bn}: unit watches ${watched}, current config.d is ${AWSCONFD_CONFIG_DIR}"
+            fi
+        done
+    elif [[ $init_sys == "launchd" ]]; then
+        local plist; plist="$(_launchd_plist_path)"
+        if [[ -f $plist ]]; then
+            printf '  %s installed\n' "$(basename "$plist")"
+            _launchctl list 2>/dev/null | grep -q "com.GingerGraham.awsconfd" && printf '  loaded\n' || printf '  not loaded\n'
+        else
+            printf '  no launchd agent installed\n'
+        fi
+    else
+        printf '  no watcher available on this host - use: eval "$(%s hook bash)"\n' "$PROG"
+    fi
+    return 0
+}
+
+# =============================================================================
+# self-update / uninstall - unchanged in scope from the original delivery.
+# Not addressed by the Part A/B review; self-update needs release
+# infrastructure that doesn't exist yet, and the top-level `uninstall`
+# command (distinct from `watch --uninstall` above, which IS implemented)
+# was never in scope for either part. Left as clear, honest stubs.
+# =============================================================================
+
+cmd_self_update() {
+    _err "self-update: not implemented yet (needs release infrastructure - GitHub Actions, checksums)"
+    _info "for now: re-run install.sh, or 'git pull' and './install.sh --local' from a clone"
+    return 1
+}
+
+cmd_uninstall() {
+    local purge=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --purge) purge=1; shift ;;
+            *) _err "uninstall: unknown option $1"; return 2 ;;
+        esac
+    done
+
+    _watch_uninstall
+
+    _info "to remove the binary: rm $(_self_path 2>/dev/null || echo "<path to awsconfd>")"
+
+    if [[ $purge -eq 1 ]]; then
+        if _confirm "restore the newest backup over $(_display_path "$AWSCONFD_CONFIG_FILE")?" 0; then
+            local newest="" n=1
+            while [[ -f "${AWSCONFD_CONFIG_FILE}.awsconfd-backup.${n}" ]]; do
+                newest="${AWSCONFD_CONFIG_FILE}.awsconfd-backup.${n}"
+                n=$((n + 1))
+            done
+            if [[ -n $newest ]]; then
+                cp -p "$newest" "$AWSCONFD_CONFIG_FILE"
+                _success "restored $(_display_path "$newest")"
+            else
+                _warn "no backups found"
+            fi
+        fi
+        if _confirm "remove $(_display_path "$AWSCONFD_CONFIG_DIR") and $(_display_path "$SCHEME_FILE")?" 0; then
+            rm -rf "$AWSCONFD_CONFIG_DIR"
+            rm -f "$SCHEME_FILE"
+            _success "removed config.d and scheme.conf"
+        fi
+    fi
+    return 0
+}
+
+# =============================================================================
+# HELP
+# =============================================================================
+
+_show_help() {
+    cat << EOF
+${PROG} - manage ~/.aws/config as a config.d directory
+
+USAGE
+    ${PROG} <command> [options]
+
+DESCRIPTION
+    AWS CLI has no native support for including multiple config files.
+    ${PROG} keeps the real configuration as numbered INI fragments in
+    ~/.aws/config.d/ and assembles them into ~/.aws/config, optionally
+    rebuilding automatically whenever a fragment changes.
+
+    Organisation-level SSO settings live in [sso-session] blocks, shared
+    by every profile for that organisation. Identity- and role-level
+    settings live in [profile] blocks. Splitting them across files is the
+    point of the tool.
+
+    ${PROG} never reads or writes ~/.aws/credentials.
+
+COMMANDS
+    init                  Create config.d, import any existing config, build
+    add-sso [NAME]        Add or update an [sso-session] block
+    add-profile [NAME]    Add or update a [profile] block
+    apply --spec FILE|-   Create fragments from a spec file, then build
+    build                 Assemble ~/.aws/config from the fragments
+    status                Show fragments, staleness, and watcher state
+    doctor [--fix]        Validate the fragments; optionally repair
+    list SUBJECT           List profiles | sso-sessions | fragments
+    enable  FRAGMENT      Re-enable a disabled fragment
+    disable FRAGMENT      Exclude a fragment from the build
+    watch --install       Install the file watcher (systemd or launchd)
+    watch --status        Show watcher state
+    watch --uninstall     Remove the watcher
+    hook bash|zsh         Print shell integration for eval
+    self-update           Update ${PROG} in place (not yet implemented)
+    uninstall [--purge]   Remove the watcher; optionally restore a backup
+
+GLOBAL OPTIONS
+    -h, --help            Show this help
+    -V, --version         Print the version
+    -q, --quiet           Suppress informational output
+    -v, --verbose         Show extra diagnostic detail
+    -y, --yes             Assume yes to confirmations
+        --dry-run         Show what would change; write nothing
+        --strict          Enforce the numbering scheme in scheme.conf
+        --config-dir DIR  Override ~/.aws/config.d
+        --config-file F   Override ~/.aws/config
+        --no-color        Disable coloured output
+    Global options are accepted before or after the command.
+
+FILES
+    ~/.aws/config                     Generated. Do not edit.
+    ~/.aws/config.d/*.conf             The source of truth.
+    ~/.config/awsconfd/scheme.conf    Your numbering scheme.
+
+EXIT STATUS
+    0  success
+    1  runtime error
+    2  usage error
+    3  validation failure
+    4  status --check: the config is stale
+
+EXAMPLES
+    # First run
+    ${PROG} init
+    ${PROG} add-sso personal
+    ${PROG} add-profile personal-admin
+    ${PROG} watch --install
+
+    # Reproduce a setup on a new machine
+    ${PROG} apply --spec ~/dotfiles/aws/multi-customer.spec.ini
+
+    # Check before a rebuild
+    ${PROG} doctor && ${PROG} build
+
+See https://github.com/GingerGraham/awsconfd for full documentation.
+EOF
+    return 0
+}
+
+# =============================================================================
+# GLOBAL ARGUMENT PARSING (review A6.1/A6.2/A6.3)
+# =============================================================================
+# Two-pass: sweep the entire argv for known GLOBAL flags wherever they
+# appear (before or after the subcommand), applying them directly and
+# removing them; the residue, in original relative order, is
+# `command [command-opts]`. `--` stops global recognition (everything after
+# it is passed through as residue verbatim). --no-provenance/--check/--fix/
+# --no-import etc. are command-specific, not global, and are deliberately
+# NOT matched here - they fall through to residue and are handled by each
+# cmd_* function's own small parser.
+
+_GLOBAL_RESIDUE=()
+
+_extract_globals() {
+    _GLOBAL_RESIDUE=()
+    local seen_dashdash=0
+    while [[ $# -gt 0 ]]; do
+        if [[ $seen_dashdash -eq 1 ]]; then
+            _GLOBAL_RESIDUE+=("$1")
+            shift
+            continue
+        fi
+        case "$1" in
+            --)
+                seen_dashdash=1
+                shift
+                ;;
+            -h|--help)
+                _show_help
+                exit 0
+                ;;
+            -V|--version)
+                _show_version
+                exit 0
+                ;;
+            -q|--quiet) QUIET=1; shift ;;
+            -v|--verbose) VERBOSE=1; shift ;;
+            -y|--yes) ASSUME_YES=1; shift ;;
+            --dry-run) DRY_RUN=1; shift ;;
+            --strict) STRICT=1; shift ;;
+            --no-color) NO_COLOR=1; shift ;;
+            --non-interactive) NON_INTERACTIVE=1; shift ;;
+            --config-dir)
+                [[ $# -ge 2 ]] || { _err "--config-dir requires a value"; exit 2; }
+                AWSCONFD_CONFIG_DIR="$2"
+                AWSCONFD_CONFIG_DIR_EXPLICIT=1
+                shift 2
+                ;;
+            --config-file)
+                [[ $# -ge 2 ]] || { _err "--config-file requires a value"; exit 2; }
+                AWSCONFD_CONFIG_FILE="$2"
+                shift 2
+                ;;
+            *)
+                _GLOBAL_RESIDUE+=("$1")
+                shift
+                ;;
+        esac
+    done
+    return 0
+}
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+main() {
+    _init_colors
+    _extract_globals "$@"
+    _init_colors
+
+    if [[ $AWSCONFD_CONFIG_DIR_EXPLICIT -eq 0 ]]; then
+        AWSCONFD_CONFIG_DIR="$(dirname "$AWSCONFD_CONFIG_FILE")/config.d"
+    fi
+    AWSCONFD_STATE_DIR="${XDG_CONFIG_HOME}/awsconfd"
+    SCHEME_FILE="${AWSCONFD_STATE_DIR}/scheme.conf"
+
+    local cmd="${_GLOBAL_RESIDUE[0]:-}"
+    if [[ -z $cmd ]]; then
+        _show_help
+        return 2
+    fi
+    local -a cmdargs=()
+    if [[ ${#_GLOBAL_RESIDUE[@]} -gt 1 ]]; then
+        cmdargs=("${_GLOBAL_RESIDUE[@]:1}")
+    fi
+
+    case "$cmd" in
+        build)        cmd_build ${cmdargs[@]+"${cmdargs[@]}"} ;;
+        init)         cmd_init ${cmdargs[@]+"${cmdargs[@]}"} ;;
+        status)       cmd_status ${cmdargs[@]+"${cmdargs[@]}"} ;;
+        list)         cmd_list ${cmdargs[@]+"${cmdargs[@]}"} ;;
+        add-sso)      cmd_add_sso ${cmdargs[@]+"${cmdargs[@]}"} ;;
+        add-profile)  cmd_add_profile ${cmdargs[@]+"${cmdargs[@]}"} ;;
+        apply)        cmd_apply ${cmdargs[@]+"${cmdargs[@]}"} ;;
+        doctor)       cmd_doctor ${cmdargs[@]+"${cmdargs[@]}"} ;;
+        enable)       cmd_enable ${cmdargs[@]+"${cmdargs[@]}"} ;;
+        disable)      cmd_disable ${cmdargs[@]+"${cmdargs[@]}"} ;;
+        watch)        cmd_watch ${cmdargs[@]+"${cmdargs[@]}"} ;;
+        hook)         cmd_hook ${cmdargs[@]+"${cmdargs[@]}"} ;;
+        self-update)  cmd_self_update ${cmdargs[@]+"${cmdargs[@]}"} ;;
+        uninstall)    cmd_uninstall ${cmdargs[@]+"${cmdargs[@]}"} ;;
+        *)
+            _err "unknown command: $cmd"
+            return 2
+            ;;
+    esac
+}
+
+main "$@"

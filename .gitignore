@@ -1,0 +1,11 @@
+# Bash and editor scratch files
+*~
+*.swp
+*.swo
+
+# pre-commit local cache (machine-local, regenerated)
+.pre-commit-cache/
+
+# Optional local test/lint output dirs
+coverage/
+test-results/
