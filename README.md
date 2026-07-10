@@ -8,6 +8,13 @@ AWS CLI has no native `include` or `config.d` support
 of numbered INI fragments that get concatenated, validated, and installed
 as `~/.aws/config`, with an optional file watcher that rebuilds on change.
 
+It is meant to work across the common AWS CLI authentication paths, not just
+Identity Center: SSO profiles, assume-role chains, static credentials that
+live in `~/.aws/credentials`, and `credential_process`-backed profiles.
+
+If you are deciding between auth methods, see
+[`docs/auth-paths.md`](docs/auth-paths.md).
+
 It solves three problems:
 
 1. **Separation.** Organisation-level SSO configuration lives apart from
@@ -42,6 +49,11 @@ git clone https://github.com/GingerGraham/awsconfd && cd awsconfd && ./install.s
 
 ## Quick start
 
+Pick the path that matches how you authenticate today. SSO-backed and
+legacy-IAM-backed profiles can coexist in the same `config.d`.
+
+### SSO path
+
 ```bash
 awsconfd init
 awsconfd add-sso personal --start-url https://d-1234567890.awsapps.com/start --sso-region eu-west-2
@@ -53,12 +65,72 @@ awsconfd list profiles
 aws configure list-profiles
 ```
 
+### Legacy IAM path
+
+Assumes the source profile already exists in `~/.aws/credentials`, for
+example as `[legacy-admin]`.
+
+```bash
+awsconfd init
+awsconfd add-profile audit-role --type assume-role --role-arn arn:aws:iam::444455556666:role/SecurityAudit --source-profile legacy-admin --region eu-west-2 --file 50-audit-role.conf
+awsconfd list profiles --with-credentials-file
+aws configure list-profiles
+```
+
 `init` creates `~/.aws/config.d/`, imports any existing hand-written
 `~/.aws/config` (backed up first, split into `99-imported.conf`, never
 touched again unless you explicitly ask `awsconfd` to update a section in
 it), and does a first build. `add-sso`/`add-profile` are small wizards that
 write or update one `[section]` block at a time - run with no flags and
 they'll prompt; pass flags for scripted, non-interactive use.
+
+For a legacy IAM role chain rooted in `~/.aws/credentials`, use the same
+`add-profile` entry point:
+
+```bash
+awsconfd add-profile audit-role \
+  --type assume-role \
+  --role-arn arn:aws:iam::444455556666:role/SecurityAudit \
+  --source-profile legacy-admin \
+  --region eu-west-2 \
+  --file 50-audit-role.conf
+```
+
+`legacy-admin` may live only in `~/.aws/credentials`; `awsconfd` will
+resolve it read-only for validation, but it will not import or rewrite that
+file.
+
+For external credential providers that implement the AWS CLI
+`credential_process` contract, see
+[`examples/credential-process.spec.ini`](examples/credential-process.spec.ini).
+
+## Command quick reference
+
+For full usage and flags at any time:
+
+```bash
+awsconfd --help
+```
+
+| Command                                 | What it does                                                       |
+| --------------------------------------- | ------------------------------------------------------------------ | ----------------------------------------------------- |
+| `init`                                  | Create `config.d`, import any existing config, and run first build |
+| `add-sso [NAME]`                        | Add or update an `[sso-session ...]` block                         |
+| `add-profile [NAME]`                    | Add or update a `[profile ...]` block                              |
+| `apply --spec FILE                      | -`                                                                 | Generate fragments from a spec file, then build       |
+| `build`                                 | Assemble `~/.aws/config` from fragments                            |
+| `status`                                | Show fragments, staleness, and watcher state                       |
+| `doctor [--fix]`                        | Validate fragments; optionally repair auto-fixable issues          |
+| `list SUBJECT`                          | List `profiles`, `sso-sessions`, or `fragments`                    |
+| `list profiles --with-credentials-file` | Include read-only shared-credentials-file profiles for diagnostics |
+| `enable FRAGMENT`                       | Re-enable a disabled fragment                                      |
+| `disable FRAGMENT`                      | Exclude a fragment from builds                                     |
+| `watch --install`                       | Install watcher integration (systemd or launchd)                   |
+| `watch --status`                        | Show watcher status                                                |
+| `watch --uninstall`                     | Remove watcher integration                                         |
+| `hook bash                              | zsh`                                                               | Print shell hook snippet for prompt-time stale checks |
+| `self-update`                           | Placeholder command (not implemented yet)                          |
+| `uninstall [--purge]`                   | Uninstall watcher; optionally restore backup/purge state           |
 
 ## How it works
 
@@ -97,6 +169,19 @@ This falls directly out of AWS's own data model:
 One `sso-session` is shared by every profile for that org. Adding a new
 role in an existing org touches only a profile fragment - never the
 session, never anyone else's fragment.
+
+Non-SSO profiles are first-class too. An assume-role profile can point at a
+`source_profile` defined either in config.d or in `~/.aws/credentials`, or
+it can use `credential_source` for environment- or metadata-backed
+credentials. Static profiles and `credential_process` profiles are managed as
+plain `[profile ...]` fragments alongside the SSO-backed ones.
+
+When you need to debug profile discovery across both config.d and the shared
+credentials file, run `awsconfd list profiles --with-credentials-file`.
+
+That diagnostics view is intentionally not deduped. If the same profile name
+exists in both config.d and `~/.aws/credentials`, both entries are shown so
+the source of each profile is explicit.
 
 ### Numbering scheme
 
@@ -159,7 +244,7 @@ control sections (`[awsconfd:scheme]`, `[awsconfd:layout]`) that say which
 fragment each section belongs in. Applying one is transactional - staged,
 validated, and only committed if the result is clean - and never overwrites
 an existing section unless you pass `--force`. See
-[`docs/spec-file.md`](docs/spec-file.md) and the three worked examples in
+[`docs/spec-file.md`](docs/spec-file.md) and the worked examples in
 [`examples/`](examples/).
 
 ## Validation
@@ -170,6 +255,9 @@ an existing section unless you pass `--force`. See
 
 - a violation prints every failure found and refuses to touch the output
   file. Full rule table: [`docs/validation.md`](docs/validation.md).
+- `credential_process` profiles are validated structurally but never executed
+  by `awsconfd`; see [`docs/validation.md`](docs/validation.md) and
+  [`examples/credential-process.spec.ini`](examples/credential-process.spec.ini).
 
 ## Hand-edited fragments
 
@@ -188,10 +276,12 @@ awsconfd enable 30-customer-a-audit
 
 ## What it does **not** do
 
-- **Credentials.** Never reads, writes, parses, or backs up
-  `~/.aws/credentials`. Never prompts for an access key or secret key.
-  Static-credential profiles reference a name in that file; the file itself
-  is entirely yours.
+- **Credentials.** Never writes, imports, or backs up
+  `~/.aws/credentials`, and never prompts for an access key or secret key.
+  It may read that file, narrowly, to resolve `source_profile` names and to
+  compare profile sets with `aws configure list-profiles`. Static-credential
+  profiles still reference a name in that file; the file itself is entirely
+  yours.
 - **AWS CLI installation or `aws sso login`.** Out of scope - use the AWS
   CLI itself for those.
 - **IAM policy, accounts, or Identity Center management.**
@@ -220,6 +310,11 @@ run `awsconfd status --check` - if it reports stale, `awsconfd build` and
 recheck. If they still disagree after a fresh build, that's almost
 certainly a bug in this tool's parser, not your config - `build` prints a
 loud (non-fatal) warning exactly for this case when `aws` is on `PATH`.
+
+**`awsconfd list profiles --with-credentials-file` shows duplicate names:**
+expected when the same profile exists in both config.d and
+`~/.aws/credentials`. The diagnostics view intentionally preserves both
+entries and does not dedupe.
 
 **A build refuses with a validation error:** the message names the
 offending file, line, and rule (`docs/validation.md` has the fix for each).

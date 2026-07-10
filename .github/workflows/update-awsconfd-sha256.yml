@@ -1,0 +1,38 @@
+name: Update awsconfd sha256
+
+on:
+  push:
+    branches:
+      - '**'
+    paths:
+      - awsconfd
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-sha256:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate checksum file
+        run: sha256sum awsconfd > awsconfd.sha256
+
+      - name: Commit updated checksum
+        run: |
+          if git diff --quiet -- awsconfd.sha256; then
+            echo "No checksum changes to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add awsconfd.sha256
+          git commit -m "chore: update awsconfd checksum"
+          git push origin "${GITHUB_REF_NAME}"

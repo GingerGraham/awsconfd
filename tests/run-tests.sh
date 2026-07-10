@@ -358,6 +358,34 @@ EOF
 err="$("$BIN" build --quiet 2>&1)"
 assert_contains "B8 undefined source_profile" "$err" "B8"
 
+setup_case "validate_b8_source_profile_in_credentials_file"
+"$BIN" init -y >/dev/null 2>&1
+mkdir -p "$_case_home/.aws"
+cat > "$_case_home/.aws/credentials" << 'EOF'
+[legacy]
+aws_access_key_id = AKIAEXAMPLE
+aws_secret_access_key = secret
+EOF
+cat > "$CONFIG_D/20-a.conf" << 'EOF'
+[profile assumed]
+role_arn = arn:aws:iam::111122223333:role/Foo
+source_profile = legacy
+region = eu-west-2
+EOF
+err="$($BIN build --quiet 2>&1)"
+assert_true "B8 source_profile in credentials file builds cleanly" "$([[ -z $err ]] && echo 0 || echo 1)"
+
+setup_case "validate_b11_invalid_credential_source"
+"$BIN" init -y >/dev/null 2>&1
+cat > "$CONFIG_D/20-a.conf" << 'EOF'
+[profile assumed]
+role_arn = arn:aws:iam::111122223333:role/Foo
+credential_source = Bogus
+region = eu-west-2
+EOF
+err="$($BIN build --quiet 2>&1)"
+assert_contains "B11 invalid credential_source" "$err" "B11"
+
 setup_case "validate_b9_overlap"
 "$BIN" init -y >/dev/null 2>&1
 cat >> "$XDG_CONFIG_HOME/awsconfd/scheme.conf" << 'EOF'
@@ -517,6 +545,29 @@ assert_contains "add-sso update changes region" "$out2" "sso_region = us-east-1"
 count=$(grep -c '^\[sso-session personal\]' "$CONFIG_D/10-sso.conf")
 assert_eq "add-sso update does not duplicate the section" "1" "$count"
 
+setup_case "addsso_normalizes_http_prefix"
+"$BIN" init -y >/dev/null 2>&1
+"$BIN" add-sso personal --start-url http://d-1.awsapps.com/start --sso-region eu-west-2 --yes --non-interactive >/dev/null 2>&1
+out_http="$(cat "$CONFIG_D/10-sso.conf")"
+assert_contains "add-sso normalizes http prefix" "$out_http" "sso_start_url = https://d-1.awsapps.com/start"
+
+setup_case "addsso_normalizes_missing_https_prefix"
+"$BIN" init -y >/dev/null 2>&1
+"$BIN" add-sso personal --start-url d-1.awsapps.com/start --sso-region eu-west-2 --yes --non-interactive >/dev/null 2>&1
+out_https="$(cat "$CONFIG_D/10-sso.conf")"
+assert_contains "add-sso prefixes missing https" "$out_https" "sso_start_url = https://d-1.awsapps.com/start"
+
+setup_case "addsso_normalizes_missing_start_suffix"
+"$BIN" init -y >/dev/null 2>&1
+"$BIN" add-sso personal --start-url https://d-1.awsapps.com --sso-region eu-west-2 --yes --non-interactive >/dev/null 2>&1
+out3="$(cat "$CONFIG_D/10-sso.conf")"
+assert_contains "add-sso normalizes missing /start" "$out3" "sso_start_url = https://d-1.awsapps.com/start"
+
+setup_case "addsso_rejects_invalid_normalized_url"
+"$BIN" init -y >/dev/null 2>&1
+err_invalid="$($BIN add-sso personal --start-url http:// --sso-region eu-west-2 --yes --non-interactive 2>&1 >/dev/null)"
+assert_contains "add-sso rejects malformed normalized url" "$err_invalid" "does not look valid after normalization"
+
 setup_case "addprofile_all_types"
 "$BIN" init -y >/dev/null 2>&1
 "$BIN" add-sso personal --start-url https://d-1.awsapps.com/start --sso-region eu-west-2 --yes --non-interactive >/dev/null 2>&1
@@ -633,6 +684,39 @@ assert_contains "watch --install prints Layer-3 recommendation" "$out" "hook"
 # =============================================================================
 section "Status"
 # =============================================================================
+
+setup_case "list_profiles_with_credentials_file"
+"$BIN" init -y >/dev/null 2>&1
+cat > "$CONFIG_D/20-managed.conf" << 'EOF'
+[profile managed]
+region = eu-west-2
+EOF
+mkdir -p "$_case_home/.aws"
+cat > "$_case_home/.aws/credentials" << 'EOF'
+[legacy-admin]
+aws_access_key_id = AKIAEXAMPLE
+aws_secret_access_key = secret
+
+[default]
+aws_access_key_id = AKIADEFAULT
+aws_secret_access_key = secret
+EOF
+out="$($BIN list profiles --with-credentials-file 2>&1)"
+assert_contains "list profiles includes config.d-managed profile" "$out" "managed"
+assert_contains "list profiles includes credentials-file profile" "$out" "legacy-admin"
+assert_contains "list profiles annotates credentials-file source" "$out" "shared-credentials-file"
+if [[ "$out" == *$'default'* ]]; then
+    fail "list profiles excludes shared-credentials default entry"
+else
+    pass "list profiles excludes shared-credentials default entry"
+fi
+
+out_porcelain="$($BIN list --porcelain profiles --with-credentials-file 2>&1)"
+assert_contains "porcelain list includes credentials-file marker" "$out_porcelain" $'legacy-admin\tshared-credentials-file'
+
+err="$($BIN list fragments --with-credentials-file 2>&1)"; rc=$?
+assert_exit "list fragments rejects credentials-file flag" "2" "$rc"
+assert_contains "invalid credentials-file flag usage is explained" "$err" "only valid with 'profiles'"
 
 setup_case "status_stale_after_touch"
 "$BIN" init -y >/dev/null 2>&1
