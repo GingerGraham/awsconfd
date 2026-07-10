@@ -87,12 +87,12 @@ renaming it, then rebuild.
 
 This falls directly out of AWS's own data model:
 
-| Belongs to the organisation | Belongs to the identity |
-|---|---|
-| `[sso-session <name>]` | `[profile <name>]` |
-| `sso_start_url` | `sso_session` (a reference) |
-| `sso_region` | `sso_account_id` |
-| `sso_registration_scopes` | `sso_role_name`, `region`, `output`, `role_arn`, ... |
+| Belongs to the organisation | Belongs to the identity                              |
+| --------------------------- | ---------------------------------------------------- |
+| `[sso-session <name>]`      | `[profile <name>]`                                   |
+| `sso_start_url`             | `sso_session` (a reference)                          |
+| `sso_region`                | `sso_account_id`                                     |
+| `sso_registration_scopes`   | `sso_role_name`, `region`, `output`, `role_arn`, ... |
 
 One `sso-session` is shared by every profile for that org. Adding a new
 role in an existing org touches only a profile fragment - never the
@@ -100,7 +100,7 @@ session, never anyone else's fragment.
 
 ### Numbering scheme
 
-Fragment filenames follow `NN-name.conf`. What each `NN` prefix *means* is
+Fragment filenames follow `NN-name.conf`. What each `NN` prefix _means_ is
 entirely up to you, declared in
 `~/.config/awsconfd/scheme.conf` (`awsconfd init` seeds `00 = defaults` and
 `10 = sso-sessions` as a starting convention, nothing more):
@@ -167,8 +167,9 @@ an existing section unless you pass `--force`. See
 `awsconfd doctor` checks everything and reports it verbosely, with
 `--fix` for the auto-fixable (trailing newlines, CRLF, file permissions).
 `awsconfd build` runs the blocking rules only, silently, before assembling
+
 - a violation prints every failure found and refuses to touch the output
-file. Full rule table: [`docs/validation.md`](docs/validation.md).
+  file. Full rule table: [`docs/validation.md`](docs/validation.md).
 
 ## Hand-edited fragments
 
