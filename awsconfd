@@ -416,7 +416,7 @@ _discover_fragments() {
 
 _fragment_basename_ok() {
     local bn="$1"
-    [[ $bn =~ ^[0-9]{2}-[a-z0-9][a-z0-9._-]*\.conf$ ]]
+    [[ $bn =~ ^[0-9]{2,3}-[a-z0-9][a-z0-9._-]*\.conf$ ]]
 }
 
 # sha256 of the concatenated *bodies* (not the banner) of a list of files,
@@ -1243,7 +1243,18 @@ _scheme_parse_range() {
         [[ $((10#$RANGE_LO)) -le $((10#$RANGE_HI)) ]] || return 1
         return 0
     fi
+    if [[ $spec =~ ^([0-9]{3})-([0-9]{3})$ ]]; then
+        RANGE_LO="${BASH_REMATCH[1]}"
+        RANGE_HI="${BASH_REMATCH[2]}"
+        [[ $((10#$RANGE_LO)) -le $((10#$RANGE_HI)) ]] || return 1
+        return 0
+    fi
     if [[ $spec =~ ^([0-9]{2})$ ]]; then
+        RANGE_LO="${BASH_REMATCH[1]}"
+        RANGE_HI="${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ $spec =~ ^([0-9]{3})$ ]]; then
         RANGE_LO="${BASH_REMATCH[1]}"
         RANGE_HI="${BASH_REMATCH[1]}"
         return 0
@@ -1341,12 +1352,106 @@ _scheme_range_for_label() {
     return 1
 }
 
+_scheme_ranges_overlap() {
+    local lo_a="$1" hi_a="$2" lo_b="$3" hi_b="$4"
+    local alo=$((10#$lo_a)) ahi=$((10#$hi_a)) blo=$((10#$lo_b)) bhi=$((10#$hi_b))
+    [[ $alo -le $bhi && $blo -le $ahi ]]
+}
+
+_scheme_range_unused() {
+    local want_lo="$1" want_hi="$2" n=${#SCHEME_LO[@]} i=0
+    while [[ $i -lt $n ]]; do
+        if _scheme_ranges_overlap "$want_lo" "$want_hi" "${SCHEME_LO[$i]}" "${SCHEME_HI[$i]}"; then
+            return 1
+        fi
+        i=$((i + 1))
+    done
+    return 0
+}
+
+_scheme_next_session_range() {
+    local block_start=200
+    while [[ $block_start -le 980 ]]; do
+        local lo hi
+        lo="$(printf '%03d' "$block_start")"
+        hi="$(printf '%03d' $((block_start + 9)))"
+        if _scheme_range_unused "$lo" "$hi"; then
+            printf '%s %s\n' "$lo" "$hi"
+            return 0
+        fi
+        block_start=$((block_start + 10))
+    done
+    return 1
+}
+
+_scheme_write_mapping() {
+    local range_key="$1" label="$2"
+
+    if [[ ! -f $SCHEME_FILE ]]; then
+        _write_scheme_template "$SCHEME_FILE"
+    fi
+    _scheme_load || return 1
+
+    EXISTING_KEYS=()
+    EXISTING_VALS=()
+    _load_existing_section_keys "$SCHEME_FILE" "scheme" || true
+
+    RENDER_KEYS=("$range_key")
+    RENDER_VALS=("$label")
+
+    local body
+    mkdir -p "$(dirname "$SCHEME_FILE")"
+    body="$(mktemp "${AWSCONFD_STATE_DIR}/.awsconfd-scheme.XXXXXX")"
+    trap 'rm -f "$body"' EXIT INT TERM
+
+    _render_section "scheme" "" "$body"
+    _section_upsert "$SCHEME_FILE" "scheme" "$body"
+
+    rm -f "$body"
+    trap - EXIT INT TERM
+    chmod 0600 "$SCHEME_FILE" 2>/dev/null || true
+    _scheme_load || true
+    return 0
+}
+
+_ensure_profile_range_for_label() {
+    local label="$1"
+    local range
+    if range="$(_scheme_range_for_label "$label")"; then
+        printf '%s\n' "$range"
+        return 0
+    fi
+
+    local lo hi
+    if ! read -r lo hi <<< "$(_scheme_next_session_range)"; then
+        _err "no free 3-digit 10-prefix session ranges remain"
+        return 1
+    fi
+
+    _scheme_write_mapping "${lo}-${hi}" "$label" || return 1
+    _info "scheme: added ${lo}-${hi} = ${label}"
+    printf '%s %s\n' "$lo" "$hi"
+    return 0
+}
+
+_file_prefix_in_label_range() {
+    local file="$1" label="$2"
+    local prefix range lo hi
+    prefix="$(_prefix_of "$file" || true)"
+    [[ -n $prefix ]] || return 1
+    range="$(_scheme_range_for_label "$label" || true)"
+    [[ -n $range ]] || return 1
+    read -r lo hi <<< "$range"
+    _scheme_ranges_overlap "$prefix" "$prefix" "$lo" "$hi"
+}
+
 # _scheme_next_free <lo> <hi> - lowest unused two-digit prefix in [lo,hi]
 # given fragments currently in config.d. Prints "" (empty) and returns 1 if
 # full.
 _scheme_next_free() {
     local lo="$1" hi="$2"
     local lo_n=$((10#$lo)) hi_n=$((10#$hi))
+    local width=${#lo}
     local -a used=()
     local f
     while IFS= read -r f; do
@@ -1356,7 +1461,7 @@ _scheme_next_free() {
     local p=$lo_n
     while [[ $p -le $hi_n ]]; do
         local pp taken=0 u
-        pp="$(printf '%02d' "$p")"
+        pp="$(printf "%0${width}d" "$p")"
         for u in ${used[@]+"${used[@]}"}; do
             case "$u" in
                 "${pp}"-*) taken=1; break ;;
@@ -1401,11 +1506,117 @@ _lowest_free_prefix_overall() {
 _prefix_of() {
     local bn
     bn="$(basename "$1")"
-    if [[ $bn =~ ^([0-9]{2}) ]]; then
+    if [[ $bn =~ ^([0-9]{3})- ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ $bn =~ ^([0-9]{2})- ]]; then
         printf '%s\n' "${BASH_REMATCH[1]}"
         return 0
     fi
     return 1
+}
+
+# If a profile is written to a prefix not currently covered by scheme.conf,
+# add an exact mapping (NN = label) inferred from the fragment filename.
+_scheme_auto_register_prefix_for_file() {
+    local file="$1"
+
+    # No scheme file means "no scheme declared"; leave behavior unchanged.
+    _scheme_load || return 0
+
+    local prefix
+    prefix="$(_prefix_of "$file" || true)"
+    [[ -n $prefix ]] || return 0
+
+    # Already covered (either exact NN or range Nx/NN-MM): nothing to do.
+    if _scheme_label_for_prefix "$prefix" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local bn stem label
+    bn="$(basename "$file")"
+    stem="${bn%.conf}"
+    stem="${stem#${prefix}-}"
+    label="${stem%%-*}"
+    [[ -n $label ]] || label="profiles"
+
+    EXISTING_KEYS=()
+    EXISTING_VALS=()
+    _load_existing_section_keys "$SCHEME_FILE" "scheme" || true
+
+    RENDER_KEYS=("$prefix")
+    RENDER_VALS=("$label")
+
+    local body
+    mkdir -p "$(dirname "$SCHEME_FILE")"
+    body="$(mktemp "${AWSCONFD_STATE_DIR}/.awsconfd-scheme.XXXXXX")"
+    trap 'rm -f "$body"' EXIT INT TERM
+
+    _render_section "scheme" "" "$body"
+    _section_upsert "$SCHEME_FILE" "scheme" "$body"
+
+    rm -f "$body"
+    trap - EXIT INT TERM
+    chmod 0600 "$SCHEME_FILE" 2>/dev/null || true
+
+    _info "scheme: added ${prefix} = ${label}"
+    return 0
+}
+
+_layout_name_is_legacy() {
+    local name="$1"
+    [[ $name =~ ^[0-9]{2}-[a-z0-9][a-z0-9._-]*\.conf$ ]]
+}
+
+_current_tree_uses_modern_layout() {
+    _scheme_load || return 1
+    local i=0
+    while [[ $i -lt ${#SCHEME_LO[@]} ]]; do
+        if [[ ${#SCHEME_LO[$i]} -eq 3 || ${#SCHEME_HI[$i]} -eq 3 ]]; then
+            return 0
+        fi
+        i=$((i + 1))
+    done
+    return 1
+}
+
+_managed_label_is_reserved() {
+    case "$1" in
+        defaults|sso-sessions|imported) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_scheme_write_entries() {
+    local strict_value="$1"
+    shift
+    local -a entries=("$@")
+    mkdir -p "$(dirname "$SCHEME_FILE")"
+    cat > "$SCHEME_FILE" << EOF
+[awsconfd]
+version = 1
+strict  = ${strict_value}
+
+[scheme]
+EOF
+    local entry
+    for entry in ${entries[@]+"${entries[@]}"}; do
+        printf '%s\n' "$entry" >> "$SCHEME_FILE"
+    done
+    chmod 0600 "$SCHEME_FILE"
+    _scheme_load || true
+    return 0
+}
+
+_migrate_target_for_reserved_fragment() {
+    case "$(basename "$1")" in
+        00-defaults.conf) printf '000-defaults.conf\n' ;;
+        10-sso.conf) printf '010-sso.conf\n' ;;
+        99-imported.conf) printf '990-imported.conf\n' ;;
+        *) return 1 ;;
+    esac
+    return 0
 }
 
 _write_scheme_template() {
@@ -1416,7 +1627,8 @@ _write_scheme_template() {
 #
 # Documents what each numeric filename prefix means. Every label and every
 # range below is an example - there are no built-in reserved ranges except
-# that `awsconfd init` seeds 00 and 10 as a convention, not a requirement.
+# that `awsconfd init` seeds 000, 010, and 990-999 as a convention, not a
+# requirement.
 #
 # Range forms:
 #   NN      exactly that prefix
@@ -1427,8 +1639,9 @@ version = 1
 strict  = false
 
 [scheme]
-00 = defaults
-10 = sso-sessions
+000 = defaults
+010 = sso-sessions
+990-999 = imported
 EOF
     chmod 0600 "$out"
     return 0
@@ -1470,7 +1683,7 @@ cmd_init() {
         _SKIP_BUILD_BACKUP=1
 
         if [[ $no_import -eq 0 ]]; then
-            if [[ ! -f "${AWSCONFD_CONFIG_DIR}/99-imported.conf" ]]; then
+            if [[ ! -f "${AWSCONFD_CONFIG_DIR}/990-imported.conf" ]]; then
                 {
                     printf '# Imported by %s init from %s\n' "$PROG" "$(_display_path "$AWSCONFD_CONFIG_FILE")"
                     printf '# on first run. Feel free to split this into separate fragments\n'
@@ -1479,9 +1692,9 @@ cmd_init() {
                     printf '# except through an explicit add-sso/add-profile update.\n'
                     printf '\n'
                     cat "$AWSCONFD_CONFIG_FILE"
-                } > "${AWSCONFD_CONFIG_DIR}/99-imported.conf"
-                chmod 0600 "${AWSCONFD_CONFIG_DIR}/99-imported.conf"
-                _info "imported existing config to: ${AWSCONFD_CONFIG_DIR}/99-imported.conf"
+                } > "${AWSCONFD_CONFIG_DIR}/990-imported.conf"
+                chmod 0600 "${AWSCONFD_CONFIG_DIR}/990-imported.conf"
+                _info "imported existing config to: ${AWSCONFD_CONFIG_DIR}/990-imported.conf"
             fi
         else
             if ! _confirm "--no-import: config.d will start empty and the next build will replace $(_display_path "$AWSCONFD_CONFIG_FILE") with a near-empty file. Continue?" 0; then
@@ -1491,9 +1704,9 @@ cmd_init() {
         fi
     fi
 
-    if [[ ! -f "${AWSCONFD_CONFIG_DIR}/00-defaults.conf" ]]; then
-        cat > "${AWSCONFD_CONFIG_DIR}/00-defaults.conf" << 'EOF'
-# 00-defaults.conf - the [default] profile.
+    if [[ ! -f "${AWSCONFD_CONFIG_DIR}/000-defaults.conf" ]]; then
+        cat > "${AWSCONFD_CONFIG_DIR}/000-defaults.conf" << 'EOF'
+# 000-defaults.conf - the [default] profile.
 #
 # There's usually little to put here: region and output are typically
 # better set per-organisation (in a profile) or per-session than globally.
@@ -1503,7 +1716,7 @@ cmd_init() {
 # region = eu-west-2
 # output = json
 EOF
-        chmod 0600 "${AWSCONFD_CONFIG_DIR}/00-defaults.conf"
+        chmod 0600 "${AWSCONFD_CONFIG_DIR}/000-defaults.conf"
     fi
 
     if [[ ! -f $SCHEME_FILE ]]; then
@@ -1814,23 +2027,33 @@ _resolve_fragment_name() {
         [[ -f $candidate ]] && { printf '%s\n' "$base"; return 0; }
     done
     # Fall back to a prefix match (e.g. "20" alone with a longer real name).
+    local -a matches=()
     local f
     for f in "$AWSCONFD_CONFIG_DIR"/"${base}"*.conf "$AWSCONFD_CONFIG_DIR"/"${base}"*.conf.disabled; do
         [[ -f $f ]] || continue
         local bn; bn="$(basename "$f")"
         bn="${bn%.disabled}"
         bn="${bn%.conf}"
-        printf '%s\n' "$bn"
-        return 0
+        matches+=("$bn")
     done
+    if [[ ${#matches[@]} -eq 1 ]]; then
+        printf '%s\n' "${matches[0]}"
+        return 0
+    fi
+    if [[ ${#matches[@]} -gt 1 ]]; then
+        _err "fragment reference '${given}' is ambiguous; matches: ${matches[*]}"
+        return 2
+    fi
     return 1
 }
 
 cmd_enable() {
     local given="${1:-}"
     [[ -z $given ]] && { _err "usage: ${PROG} enable <fragment>"; return 2; }
-    local base
-    if ! base="$(_resolve_fragment_name "$given")"; then
+    local base rc=0
+    base="$(_resolve_fragment_name "$given")" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        [[ $rc -eq 2 ]] && return 1
         _err "fragment not found: $given"
         return 1
     fi
@@ -1849,8 +2072,10 @@ cmd_enable() {
 cmd_disable() {
     local given="${1:-}"
     [[ -z $given ]] && { _err "usage: ${PROG} disable <fragment>"; return 2; }
-    local base
-    if ! base="$(_resolve_fragment_name "$given")"; then
+    local base rc=0
+    base="$(_resolve_fragment_name "$given")" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        [[ $rc -eq 2 ]] && return 1
         _err "fragment not found: $given"
         return 1
     fi
@@ -1988,8 +2213,10 @@ cmd_add_sso() {
         return 2
     fi
 
+    _ensure_profile_range_for_label "$name" >/dev/null || return 1
+
     if [[ -z $file ]]; then
-        file="$(_target_fragment_for_label "sso-sessions" "10-sso.conf")" || return 1
+        file="$(_target_fragment_for_label "sso-sessions" "010-sso.conf")" || return 1
     else
         case "$file" in
             /*) ;;
@@ -2202,6 +2429,12 @@ cmd_add_profile() {
                 return 2
             fi
             [[ -z $sso_role_name ]] && { _err "sso_role_name is required"; return 2; }
+            if ! _ensure_profile_range_for_label "$sso_session" >/dev/null; then
+                return 1
+            fi
+            if [[ -z $label_opt ]]; then
+                label_opt="$sso_session"
+            fi
             RENDER_KEYS+=(sso_session sso_account_id sso_role_name)
             RENDER_VALS+=("$sso_session" "$sso_account_id" "$sso_role_name")
             ;;
@@ -2281,6 +2514,14 @@ cmd_add_profile() {
     [[ -n $region ]] && { RENDER_KEYS+=(region); RENDER_VALS+=("$region"); }
     [[ -n $output ]] && { RENDER_KEYS+=(output); RENDER_VALS+=("$output"); }
 
+    if [[ $type == "sso" && -n $file_opt ]] && ! _file_prefix_in_label_range "$file_opt" "$sso_session"; then
+        if [[ $STRICT -eq 1 || $SCHEME_STRICT_DECLARED -eq 1 ]]; then
+            _err "add-profile: ${file_opt} falls outside the declared range for sso_session '${sso_session}'"
+            return 1
+        fi
+        _warn "add-profile: ${file_opt} falls outside the declared range for sso_session '${sso_session}'"
+    fi
+
     if ! _resolve_placement "$file_opt" "$label_opt" "$name"; then
         return 1
     fi
@@ -2321,6 +2562,8 @@ cmd_add_profile() {
     trap - EXIT INT TERM
     chmod 0600 "$PLACEMENT_FILE" 2>/dev/null || true
 
+    _scheme_auto_register_prefix_for_file "$PLACEMENT_FILE"
+
     _success "wrote [${header}] to $(basename "$PLACEMENT_FILE")"
     cmd_build
     return 0
@@ -2335,6 +2578,7 @@ cmd_add_profile() {
 
 _spec_infer_label_for_type() {
     case "$1" in
+        default) printf 'defaults\n' ;;
         sso-session) printf 'sso-sessions\n' ;;
         profile) printf 'profile\n' ;;
         *) printf '%s\n' "$1" ;;
@@ -2343,11 +2587,12 @@ _spec_infer_label_for_type() {
 }
 
 cmd_apply() {
-    local spec="" force=0
+    local spec="" force=0 force_modern_layout=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --spec) spec="$2"; shift 2 ;;
             --force) force=1; shift ;;
+            --force-modern-layout) force_modern_layout=1; shift ;;
             --dry-run) DRY_RUN=1; shift ;;
             --strict) STRICT=1; shift ;;
             *) _err "apply: unknown option $1"; return 2 ;;
@@ -2498,12 +2743,18 @@ cmd_apply() {
     fi
     _scheme_load || true
 
+    local modern_tree=0
+    if _current_tree_uses_modern_layout; then
+        modern_tree=1
+    fi
+
     local p=0 pn=${#payload_headers[@]}
     local -a plan_lines=()
     while [[ $p -lt $pn ]]; do
         local header="${payload_headers[$p]}" pstart="${payload_starts[$p]}" pend="${payload_ends[$p]}"
         _classify_header "$header"
         local ptype="$HDR_TYPE"
+        local pname="$HDR_NAME"
 
         # target: layout entry wins
         local target=""
@@ -2513,17 +2764,64 @@ cmd_apply() {
             li=$((li + 1))
         done
 
+        local layout_modernized=0
+        if [[ -n $target && $modern_tree -eq 1 ]] && _layout_name_is_legacy "$target"; then
+            if [[ $force_modern_layout -eq 0 ]]; then
+                _err "apply: legacy layout entry '${target}' is not allowed in a 3-digit-managed tree; migrate first or re-run with --force-modern-layout"
+                rm -rf "$stage"
+                trap - EXIT INT TERM
+                [[ $spec == "-" ]] && rm -f "$spec_file"
+                return 2
+            fi
+            layout_modernized=1
+            target=""
+        fi
+
         local inferred=0
         if [[ -z $target ]]; then
             inferred=1
             local label
             label="$(_spec_infer_label_for_type "$ptype")"
+            [[ $header == "default" ]] && label="defaults"
+            if [[ $header == "default" ]]; then
+                target="000-defaults.conf"
+            fi
+            if [[ $ptype == "profile" ]]; then
+                local j=$((pstart + 1))
+                while [[ $j -le $pend ]]; do
+                    local l="${SPEC_LINES[$((j - 1))]}"
+                    if [[ $l == "${l#[[:space:]]}" ]] && [[ $l =~ ^sso_session[[:space:]]*=(.*)$ ]]; then
+                        label="$(_trim "${BASH_REMATCH[1]}")"
+                        if [[ $modern_tree -eq 1 ]]; then
+                            _ensure_profile_range_for_label "$label" >/dev/null || {
+                                rm -rf "$stage"
+                                trap - EXIT INT TERM
+                                [[ $spec == "-" ]] && rm -f "$spec_file"
+                                return 1
+                            }
+                            _scheme_load || true
+                        fi
+                        break
+                    fi
+                    j=$((j + 1))
+                done
+            fi
             local range
-            if range="$(_scheme_range_for_label "$label")"; then
+            if [[ -z $target ]] && range="$(_scheme_range_for_label "$label")"; then
                 local lo hi; read -r lo hi <<< "$range"
                 local free
                 if free="$(_scheme_next_free "$lo" "$hi")"; then
-                    target="${free}-${label}.conf"
+                    case "$label" in
+                        defaults) target="${free}-defaults.conf" ;;
+                        sso-sessions) target="${free}-sso.conf" ;;
+                        *)
+                            if [[ $ptype == "profile" && -n $pname ]]; then
+                                target="${free}-${pname}.conf"
+                            else
+                                target="${free}-${label}.conf"
+                            fi
+                            ;;
+                    esac
                 fi
             fi
             if [[ -z $target ]]; then
@@ -2531,7 +2829,11 @@ cmd_apply() {
                 free2="$(_lowest_free_prefix_overall || echo "00")"
                 target="${free2}-${ptype}.conf"
             fi
-            _warn "W2: [${header}] has no [awsconfd:layout] entry; placed by scheme as ${target}"
+            if [[ $layout_modernized -eq 1 ]]; then
+                _info "modernized legacy layout for [${header}] to ${target}"
+            else
+                _warn "W2: [${header}] has no [awsconfd:layout] entry; placed by scheme as ${target}"
+            fi
         fi
 
         local target_path="${stage}/${target}"
@@ -3015,6 +3317,165 @@ _watch_status_report() {
 }
 
 # =============================================================================
+# migrate - convert managed 2-digit layout to modern 3-digit layout
+# =============================================================================
+
+cmd_migrate() {
+    local check_only=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run|--check) check_only=1; shift ;;
+            -y|--yes) ASSUME_YES=1; shift ;;
+            *) _err "migrate: unknown option $1"; return 2 ;;
+        esac
+    done
+
+    [[ -d $AWSCONFD_CONFIG_DIR ]] || { _err "config.d not found; run '${PROG} init' first"; return 1; }
+
+    local strict_value="false"
+    if [[ -f $SCHEME_FILE ]]; then
+        _scheme_load || true
+        [[ $SCHEME_STRICT_DECLARED -eq 1 ]] && strict_value="true"
+    fi
+
+    local -a old_lo=("${SCHEME_LO[@]+${SCHEME_LO[@]}}")
+    local -a old_hi=("${SCHEME_HI[@]+${SCHEME_HI[@]}}")
+    local -a old_label=("${SCHEME_LABEL[@]+${SCHEME_LABEL[@]}}")
+
+    local -a new_entries=("000 = defaults" "010 = sso-sessions" "990-999 = imported")
+    SCHEME_LO=("000" "010" "990")
+    SCHEME_HI=("000" "010" "999")
+    SCHEME_LABEL=("defaults" "sso-sessions" "imported")
+
+    local i=0
+    while [[ $i -lt ${#old_label[@]} ]]; do
+        if [[ ${#old_lo[$i]} -eq 3 || ${#old_hi[$i]} -eq 3 ]]; then
+            if ! _managed_label_is_reserved "${old_label[$i]}"; then
+                new_entries+=("${old_lo[$i]}-${old_hi[$i]} = ${old_label[$i]}")
+                SCHEME_LO+=("${old_lo[$i]}")
+                SCHEME_HI+=("${old_hi[$i]}")
+                SCHEME_LABEL+=("${old_label[$i]}")
+            fi
+        fi
+        i=$((i + 1))
+    done
+
+    i=0
+    while [[ $i -lt ${#old_label[@]} ]]; do
+        if [[ ${#old_lo[$i]} -eq 2 && ${#old_hi[$i]} -eq 2 ]] && ! _managed_label_is_reserved "${old_label[$i]}"; then
+            if ! _scheme_range_for_label "${old_label[$i]}" >/dev/null 2>&1; then
+                local lo hi
+                read -r lo hi <<< "$(_scheme_next_session_range)" || {
+                    _err "migrate: no free 3-digit session ranges remain"
+                    return 1
+                }
+                new_entries+=("${lo}-${hi} = ${old_label[$i]}")
+                SCHEME_LO+=("$lo")
+                SCHEME_HI+=("$hi")
+                SCHEME_LABEL+=("${old_label[$i]}")
+            fi
+        fi
+        i=$((i + 1))
+    done
+
+    local -a legacy_files=()
+    local f
+    while IFS= read -r f; do
+        local prefix
+        prefix="$(_prefix_of "$f" || true)"
+        [[ ${#prefix} -eq 2 ]] || continue
+        legacy_files+=("$f")
+    done < <(_discover_fragments "$AWSCONFD_CONFIG_DIR")
+
+    local -a srcs=() dsts=()
+    for f in ${legacy_files[@]+"${legacy_files[@]}"}; do
+        local dest=""
+        if dest="$(_migrate_target_for_reserved_fragment "$f" 2>/dev/null)"; then
+            :
+        else
+            local prefix label range lo hi next
+            prefix="$(_prefix_of "$f" || true)"
+            label=""
+            i=0
+            while [[ $i -lt ${#old_label[@]} ]]; do
+                if _scheme_ranges_overlap "$prefix" "$prefix" "${old_lo[$i]}" "${old_hi[$i]}"; then
+                    label="${old_label[$i]}"
+                    break
+                fi
+                i=$((i + 1))
+            done
+            [[ -n $label ]] || continue
+            _managed_label_is_reserved "$label" && continue
+            range="$(_scheme_range_for_label "$label" || true)"
+            [[ -n $range ]] || continue
+            read -r lo hi <<< "$range"
+            next="$(_scheme_next_free "$lo" "$hi" || true)"
+            [[ -n $next ]] || { _err "migrate: range ${lo}-${hi} is full while placing label '${label}'"; return 1; }
+            dest="${next}-$(basename "$f" | sed -E 's/^[0-9]{2}-//')"
+        fi
+
+        if [[ -n $dest && $(basename "$f") != "$dest" ]]; then
+            if [[ -e "${AWSCONFD_CONFIG_DIR}/${dest}" ]]; then
+                _err "migrate: target already exists: ${dest}"
+                return 1
+            fi
+            srcs+=("$f")
+            dsts+=("${AWSCONFD_CONFIG_DIR}/${dest}")
+        fi
+    done
+
+    if [[ ${#srcs[@]} -eq 0 && -f $SCHEME_FILE ]]; then
+        _info "migrate: no legacy managed fragments to rename"
+        if [[ $check_only -eq 1 ]]; then
+            printf 'REWRITE scheme.conf\n'
+            return 0
+        fi
+    fi
+
+    local idx=0
+    if [[ $check_only -eq 1 ]]; then
+        while [[ $idx -lt ${#srcs[@]} ]]; do
+            printf 'RENAME %s -> %s\n' "$(basename "${srcs[$idx]}")" "$(basename "${dsts[$idx]}")"
+            idx=$((idx + 1))
+        done
+        printf 'REWRITE scheme.conf\n'
+        return 0
+    fi
+
+    if [[ $ASSUME_YES -eq 0 ]] && ! _confirm "migrate managed legacy fragments and rewrite scheme.conf to modern 3-digit layout?" 0; then
+        _info "not migrated"
+        return 0
+    fi
+
+    mkdir -p "$AWSCONFD_STATE_DIR"
+    local backup_dir
+    backup_dir="$(mktemp -d "${AWSCONFD_STATE_DIR}/migrate-backup.XXXXXX")"
+    if [[ -f $SCHEME_FILE ]]; then
+        cp -p "$SCHEME_FILE" "$backup_dir/scheme.conf"
+    fi
+
+    idx=0
+    while [[ $idx -lt ${#srcs[@]} ]]; do
+        cp -p "${srcs[$idx]}" "$backup_dir/$(basename "${srcs[$idx]}")"
+        idx=$((idx + 1))
+    done
+
+    idx=0
+    while [[ $idx -lt ${#srcs[@]} ]]; do
+        mv "${srcs[$idx]}" "${dsts[$idx]}"
+        _info "migrate: $(basename "${srcs[$idx]}") -> $(basename "${dsts[$idx]}")"
+        idx=$((idx + 1))
+    done
+
+    _scheme_write_entries "$strict_value" "${new_entries[@]}" || return 1
+    _info "migrate: rewrote scheme.conf"
+    _info "migrate backup: $(_display_path "$backup_dir")"
+
+    cmd_build
+    return 0
+}
+
+# =============================================================================
 # self-update / uninstall - unchanged in scope from the original delivery.
 # Not addressed by the Part A/B review; self-update needs release
 # infrastructure that doesn't exist yet, and the top-level `uninstall`
@@ -3094,6 +3555,10 @@ COMMANDS
     add-sso [NAME]        Add or update an [sso-session] block
     add-profile [NAME]    Add or update a [profile] block
     apply --spec FILE|-   Create fragments from a spec file, then build
+                          add --force-modern-layout to modernize legacy
+                          explicit 2-digit layout entries in place
+    migrate               Convert managed legacy 2-digit layout to 3-digit
+                          use --dry-run to preview, --yes to skip confirm
     build                 Assemble ~/.aws/config from the fragments
     status                Show fragments, staleness, and watcher state
     doctor [--fix]        Validate the fragments; optionally repair
@@ -3142,6 +3607,11 @@ EXAMPLES
 
     # Reproduce a setup on a new machine
     ${PROG} apply --spec ~/dotfiles/aws/multi-customer.spec.ini
+    ${PROG} apply --spec ~/dotfiles/aws/legacy-layout.spec.ini --force-modern-layout
+
+    # Convert an old managed 2-digit tree to the modern layout
+    ${PROG} migrate --dry-run
+    ${PROG} migrate --yes
 
     # Check before a rebuild
     ${PROG} doctor && ${PROG} build
@@ -3247,6 +3717,7 @@ main() {
         add-sso)      cmd_add_sso ${cmdargs[@]+"${cmdargs[@]}"} ;;
         add-profile)  cmd_add_profile ${cmdargs[@]+"${cmdargs[@]}"} ;;
         apply)        cmd_apply ${cmdargs[@]+"${cmdargs[@]}"} ;;
+        migrate)      cmd_migrate ${cmdargs[@]+"${cmdargs[@]}"} ;;
         doctor)       cmd_doctor ${cmdargs[@]+"${cmdargs[@]}"} ;;
         enable)       cmd_enable ${cmdargs[@]+"${cmdargs[@]}"} ;;
         disable)      cmd_disable ${cmdargs[@]+"${cmdargs[@]}"} ;;

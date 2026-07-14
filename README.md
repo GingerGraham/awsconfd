@@ -57,7 +57,7 @@ legacy-IAM-backed profiles can coexist in the same `config.d`.
 ```bash
 awsconfd init
 awsconfd add-sso personal --start-url https://d-1234567890.awsapps.com/start --sso-region eu-west-2
-awsconfd add-profile personal-admin --sso-session personal --sso-account-id 111122223333 --sso-role-name AdministratorAccess --region eu-west-2 --file 20-personal-admin.conf
+awsconfd add-profile personal-admin --sso-session personal --sso-account-id 111122223333 --sso-role-name AdministratorAccess --region eu-west-2
 awsconfd watch --install
 
 # verify
@@ -72,13 +72,13 @@ example as `[legacy-admin]`.
 
 ```bash
 awsconfd init
-awsconfd add-profile audit-role --type assume-role --role-arn arn:aws:iam::444455556666:role/SecurityAudit --source-profile legacy-admin --region eu-west-2 --file 50-audit-role.conf
+awsconfd add-profile audit-role --type assume-role --role-arn arn:aws:iam::444455556666:role/SecurityAudit --source-profile legacy-admin --region eu-west-2 --file 500-audit-role.conf
 awsconfd list profiles --with-credentials-file
 aws configure list-profiles
 ```
 
 `init` creates `~/.aws/config.d/`, imports any existing hand-written
-`~/.aws/config` (backed up first, split into `99-imported.conf`, never
+`~/.aws/config` (backed up first, split into `990-imported.conf`, never
 touched again unless you explicitly ask `awsconfd` to update a section in
 it), and does a first build. `add-sso`/`add-profile` are small wizards that
 write or update one `[section]` block at a time - run with no flags and
@@ -93,7 +93,7 @@ awsconfd add-profile audit-role \
   --role-arn arn:aws:iam::444455556666:role/SecurityAudit \
   --source-profile legacy-admin \
   --region eu-west-2 \
-  --file 50-audit-role.conf
+  --file 500-audit-role.conf
 ```
 
 `legacy-admin` may live only in `~/.aws/credentials`; `awsconfd` will
@@ -117,7 +117,8 @@ awsconfd --help
 | `init`                                  | Create `config.d`, import any existing config, and run first build |
 | `add-sso [NAME]`                        | Add or update an `[sso-session ...]` block                         |
 | `add-profile [NAME]`                    | Add or update a `[profile ...]` block                              |
-| `apply --spec FILE \| -`                | Generate fragments from a spec file (or stdin), then build         |
+| `apply --spec FILE \| - [--force-modern-layout]` | Generate fragments from a spec file (or stdin), then build |
+| `migrate [--dry-run\|--check] [--yes]` | Convert managed legacy 2-digit layout to the modern 3-digit model |
 | `build`                                 | Assemble `~/.aws/config` from fragments                            |
 | `status`                                | Show fragments, staleness, and watcher state                       |
 | `doctor [--fix]`                        | Validate fragments; optionally repair auto-fixable issues          |
@@ -136,10 +137,10 @@ awsconfd --help
 
 ```
 ~/.aws/config.d/
-├── 00-defaults.conf       # [default]
-├── 10-sso.conf            # [sso-session ...] blocks
-├── 20-personal-admin.conf # [profile ...] blocks
-└── 30-customer-a-audit.conf
+├── 000-defaults.conf        # [default]
+├── 010-sso.conf             # [sso-session ...] blocks
+├── 200-personal-admin.conf  # [profile ...] blocks for personal session
+└── 210-customer-a-audit.conf
          |
     awsconfd build
          |
@@ -185,27 +186,29 @@ the source of each profile is explicit.
 
 ### Numbering scheme
 
-Fragment filenames follow `NN-name.conf`. What each `NN` prefix _means_ is
-entirely up to you, declared in
-`~/.config/awsconfd/scheme.conf` (`awsconfd init` seeds `00 = defaults` and
-`10 = sso-sessions` as a starting convention, nothing more):
+Fragment filenames now follow a modern three-digit managed convention,
+while legacy two-digit trees remain readable during migration.
+`~/.config/awsconfd/scheme.conf` is the source of truth for what each prefix
+means (`awsconfd init` seeds `000 = defaults`, `010 = sso-sessions`, and
+`990-999 = imported`):
 
 ```ini
 [scheme]
-00    = defaults
-10    = sso-sessions
-2x    = personal
-30-39 = customer-a
-40-49 = customer-b
+000     = defaults
+010     = sso-sessions
+200-209 = personal
+210-219 = customer-a
+220-229 = customer-b
+990-999 = imported
 ```
 
-`2x` means the whole `20`-`29` decade; `30-39` is an explicit inclusive
-range; `55` alone would mean exactly that prefix. By default
+Each new `sso-session` gets its own auto-allocated 10-prefix range, starting
+at `200-209` and moving upward by tens. SSO-backed `add-profile` then places
+profiles into the range owned by their `sso_session` automatically, so you no
+longer have to pick a filename prefix for the common SSO path. By default
 (`strict = false`), a fragment whose prefix falls outside every declared
-range just gets a warning from `doctor` - you're never blocked, which
-matters once you're managing twenty-plus client orgs and the manifest
-hasn't caught up yet. Pass `--strict` (or set `strict = true`) to make that
-warning block instead. Full details: [`docs/numbering.md`](docs/numbering.md).
+range just gets a warning from `doctor`; with `--strict` (or `strict = true`)
+that becomes blocking. Full details: [`docs/numbering.md`](docs/numbering.md).
 
 ## The watcher
 
@@ -243,9 +246,27 @@ A spec file is a valid AWS config file plus two `awsconfd:`-namespaced
 control sections (`[awsconfd:scheme]`, `[awsconfd:layout]`) that say which
 fragment each section belongs in. Applying one is transactional - staged,
 validated, and only committed if the result is clean - and never overwrites
-an existing section unless you pass `--force`. See
+an existing section unless you pass `--force`. Legacy explicit two-digit
+layout entries are rejected in a modern three-digit-managed tree unless you
+re-run with `--force-modern-layout`, which tells `awsconfd` to re-place the
+sections according to the modern scheme instead. See
 [`docs/spec-file.md`](docs/spec-file.md) and the worked examples in
 [`examples/`](examples/).
+
+## Migrating a legacy tree
+
+If you already have a managed two-digit tree such as `00-defaults.conf`,
+`10-sso.conf`, or `20-personal-admin.conf`, convert it in one pass with:
+
+```bash
+awsconfd migrate --dry-run
+awsconfd migrate --yes
+```
+
+`migrate` renames managed fragments into the modern three-digit layout,
+rewrites `scheme.conf`, creates a backup under `~/.config/awsconfd/`, and
+leaves unmanaged oddities alone. It is intended for trees that were already
+managed by `awsconfd`, not arbitrary hand-organised layouts.
 
 ## Validation
 
@@ -267,12 +288,14 @@ then only that one `[section]` block - every other byte of the fragment is
 untouched. To temporarily disable a fragment without deleting it:
 
 ```bash
-awsconfd disable 30-customer-a-audit
+awsconfd disable 210-customer-a-audit
 # ...
-awsconfd enable 30-customer-a-audit
+awsconfd enable 210-customer-a-audit
 ```
 
-(Any of `30`, `30-customer-a-audit`, or `30-customer-a-audit.conf` works.)
+(Any of `210`, `210-customer-a-audit`, or `210-customer-a-audit.conf` works,
+unless the shorthand is ambiguous with another fragment prefix, in which case
+`awsconfd` now asks you to be explicit.)
 
 ## What it does **not** do
 

@@ -6,7 +6,7 @@ single file - the point is round-tripping a configuration between machines
 `jq`, `yq`, or anything beyond the INI parser this tool already has.
 
 A spec file is a valid AWS config file plus two `awsconfd:`-namespaced
-control sections. This means an existing `~/.aws/config` is *almost* a
+control sections. This means an existing `~/.aws/config` is _almost_ a
 valid spec already, and the whole thing is legible without documentation.
 
 ```ini
@@ -17,17 +17,17 @@ version = 1
 strict  = false
 
 [awsconfd:scheme]
-00    = defaults
-10    = sso-sessions
-2x    = personal
-30-39 = customer-a
+000     = defaults
+010     = sso-sessions
+200-209 = personal
+210-219 = customer-a
 
 [awsconfd:layout]
-default                  = 00-defaults.conf
-sso-session personal     = 10-sso.conf
-sso-session customer-a   = 10-sso.conf
-profile personal-admin   = 20-personal-admin.conf
-profile customer-a-audit = 30-customer-a-audit.conf
+default                  = 000-defaults.conf
+sso-session personal     = 010-sso.conf
+sso-session customer-a   = 010-sso.conf
+profile personal-admin   = 200-personal-admin.conf
+profile customer-a-audit = 210-customer-a-audit.conf
 
 # ---- everything below is verbatim AWS config INI ----
 
@@ -68,7 +68,7 @@ region         = us-east-1
   they appear below (`default`, `profile personal-admin`,
   `sso-session personal`), values are the fragment filename that section
   should live in. Several sections can share one filename (both
-  `sso-session` lines above land in `10-sso.conf`).
+  `sso-session` lines above land in `010-sso.conf`).
 
 ## Applying
 
@@ -77,9 +77,9 @@ file order:
 
 - If it has a layout entry, it's written there.
 - If it doesn't, it's placed by the scheme (the label inferred from its
-  section type: `sso-session` → the `sso-sessions` label, `profile` →
-  asked interactively or, under `--non-interactive`, allocated the lowest
-  free prefix with a **W2** warning). Placement-by-inference is always
+  section type: `sso-session` → the `sso-sessions` label, SSO-backed
+  `profile` sections → the range owned by their `sso_session`, everything
+  else → inferred or interactively placed). Placement-by-inference is always
   logged so you can see what happened.
 - If the section **already exists** anywhere in `config.d` (checked across
   every fragment, not just the target), it's **skipped** and reported -
@@ -95,6 +95,12 @@ real changes.
 
 `--dry-run` prints the full plan (`CREATE 20-x.conf [profile x]` /
 `SKIP ...` / `UPDATE ...`) and writes nothing, including `scheme.conf`.
+
+Legacy explicit layout entries such as `00-defaults.conf` or
+`20-personal-admin.conf` are rejected when the target tree already uses the
+modern three-digit managed layout. Re-run with `--force-modern-layout` to
+ignore those legacy explicit filenames and let `awsconfd` re-place the
+sections according to the modern scheme.
 
 `awsconfd apply --spec -` reads the spec from stdin.
 

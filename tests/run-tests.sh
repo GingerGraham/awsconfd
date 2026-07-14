@@ -457,7 +457,7 @@ region = eu-central-1
 EOF
 "$BIN" init -y >/dev/null 2>&1
 cmp -s "${AWSCONFD_CONFIG_FILE}.awsconfd-backup.1" <(printf '[default]\nregion = us-west-2\n\n[profile handwritten]\nregion = eu-central-1\n') && pass "backup byte-identical to original" || fail "backup byte-identical to original"
-assert_true "99-imported.conf created" "$([[ -f "$(dirname "$AWSCONFD_CONFIG_FILE")/config.d/99-imported.conf" ]] && echo 0 || echo 1)"
+assert_true "990-imported.conf created" "$([[ -f "$(dirname "$AWSCONFD_CONFIG_FILE")/config.d/990-imported.conf" ]] && echo 0 || echo 1)"
 sections_after=$(grep -c '^\[' "$AWSCONFD_CONFIG_FILE")
 assert_eq "rebuilt config has same section count as original" "2" "$sections_after"
 
@@ -469,14 +469,14 @@ region = us-west-2
 EOF
 "$BIN" init --no-import -y >/dev/null 2>&1
 assert_true "backup taken under --no-import" "$([[ -f "${AWSCONFD_CONFIG_FILE}.awsconfd-backup.1" ]] && echo 0 || echo 1)"
-assert_true "no 99-imported.conf under --no-import" "$([[ ! -f "$(dirname "$AWSCONFD_CONFIG_FILE")/config.d/99-imported.conf" ]] && echo 0 || echo 1)"
+assert_true "no 990-imported.conf under --no-import" "$([[ ! -f "$(dirname "$AWSCONFD_CONFIG_FILE")/config.d/990-imported.conf" ]] && echo 0 || echo 1)"
 
 setup_case "init_idempotent"
 "$BIN" init -y >/dev/null 2>&1
-sum_before=$(cksum < "$CONFIG_D/00-defaults.conf")
+sum_before=$(cksum < "$CONFIG_D/000-defaults.conf")
 "$BIN" init -y >/dev/null 2>&1
-sum_after=$(cksum < "$CONFIG_D/00-defaults.conf")
-assert_eq "re-running init overwrites nothing in 00-defaults.conf" "$sum_before" "$sum_after"
+sum_after=$(cksum < "$CONFIG_D/000-defaults.conf")
+assert_eq "re-running init overwrites nothing in 000-defaults.conf" "$sum_before" "$sum_after"
 
 setup_case "init_backup_numbering"
 for i in 1 2 3; do
@@ -519,6 +519,27 @@ else
     pass "2x / NN-MM / NN range forms all parse without W2 false positives"
 fi
 
+setup_case "scheme_range_forms_3digit"
+"$BIN" init -y >/dev/null 2>&1
+cat >> "$XDG_CONFIG_HOME/awsconfd/scheme.conf" << 'EOF'
+200-209 = personal
+350     = one-off
+EOF
+cat > "$CONFIG_D/205-p.conf" << 'EOF'
+[profile p205]
+region = eu-west-2
+EOF
+cat > "$CONFIG_D/350-o.conf" << 'EOF'
+[profile p350]
+region = eu-west-2
+EOF
+err="$($BIN doctor 2>&1)"
+if [[ "$err" == *"W2"* ]]; then
+    fail "3-digit explicit ranges parse without W2 false positives" "$err"
+else
+    pass "3-digit explicit ranges parse without W2 false positives"
+fi
+
 setup_case "scheme_label_allocation"
 "$BIN" init -y >/dev/null 2>&1
 cat >> "$XDG_CONFIG_HOME/awsconfd/scheme.conf" << 'EOF'
@@ -530,6 +551,39 @@ assert_true "first allocation picks 20" "$([[ -f "$CONFIG_D/20-p1.conf" ]] && ec
 "$BIN" add-profile p2 --type sso --sso-session personal --sso-account-id 111122223333 --sso-role-name Bar --region eu-west-2 --label personal --yes --non-interactive >/dev/null 2>&1
 assert_true "second allocation picks lowest free (21)" "$([[ -f "$CONFIG_D/21-p2.conf" ]] && echo 0 || echo 1)"
 
+setup_case "scheme_label_allocation_3digit"
+"$BIN" init -y >/dev/null 2>&1
+cat >> "$XDG_CONFIG_HOME/awsconfd/scheme.conf" << 'EOF'
+200-209 = personal
+EOF
+"$BIN" add-sso personal --start-url https://d-1.awsapps.com/start --sso-region eu-west-2 --yes --non-interactive >/dev/null 2>&1
+"$BIN" add-profile p1 --type sso --sso-session personal --sso-account-id 111122223333 --sso-role-name Foo --region eu-west-2 --label personal --yes --non-interactive >/dev/null 2>&1
+assert_true "first 3-digit allocation picks 200" "$([[ -f "$CONFIG_D/200-p1.conf" ]] && echo 0 || echo 1)"
+"$BIN" add-profile p2 --type sso --sso-session personal --sso-account-id 111122223333 --sso-role-name Bar --region eu-west-2 --label personal --yes --non-interactive >/dev/null 2>&1
+assert_true "second 3-digit allocation picks 201" "$([[ -f "$CONFIG_D/201-p2.conf" ]] && echo 0 || echo 1)"
+
+setup_case "scheme_auto_register_uncovered_prefix_on_add_profile"
+"$BIN" init -y >/dev/null 2>&1
+"$BIN" add-sso personal --start-url https://d-1.awsapps.com/start --sso-region eu-west-2 --yes --non-interactive >/dev/null 2>&1
+"$BIN" add-profile personal-admin --type sso --sso-session personal --sso-account-id 111122223333 --sso-role-name Admin --region eu-west-2 --file 20-personal-admin.conf --yes --non-interactive >/dev/null 2>&1
+scheme_now="$(cat "$XDG_CONFIG_HOME/awsconfd/scheme.conf")"
+assert_contains "add-profile auto-registers uncovered prefix in scheme.conf" "$scheme_now" "20 = personal"
+doctor_err="$($BIN doctor 2>&1)"
+if [[ "$doctor_err" == *"W2"* ]]; then
+    fail "auto-registered prefix does not trigger W2" "$doctor_err"
+else
+    pass "auto-registered prefix does not trigger W2"
+fi
+
+setup_case "scheme_addsso_allocates_session_range"
+"$BIN" init -y >/dev/null 2>&1
+"$BIN" add-sso personal --start-url https://d-1.awsapps.com/start --sso-region eu-west-2 --yes --non-interactive >/dev/null 2>&1
+scheme_now="$(cat "$XDG_CONFIG_HOME/awsconfd/scheme.conf")"
+assert_contains "add-sso allocates 3-digit range for session" "$scheme_now" "200-209 = personal"
+"$BIN" add-sso customer-a --start-url https://d-2.awsapps.com/start --sso-region eu-west-2 --yes --non-interactive >/dev/null 2>&1
+scheme_now="$(cat "$XDG_CONFIG_HOME/awsconfd/scheme.conf")"
+assert_contains "second add-sso allocates next free 3-digit range" "$scheme_now" "210-219 = customer-a"
+
 # =============================================================================
 section "add-sso / add-profile (section-update primitive in practice)"
 # =============================================================================
@@ -537,30 +591,30 @@ section "add-sso / add-profile (section-update primitive in practice)"
 setup_case "addsso_create_and_update"
 "$BIN" init -y >/dev/null 2>&1
 "$BIN" add-sso personal --start-url https://d-1.awsapps.com/start --sso-region eu-west-2 --yes --non-interactive >/dev/null 2>&1
-out1="$(cat "$CONFIG_D/10-sso.conf")"
+out1="$(cat "$CONFIG_D/010-sso.conf")"
 assert_contains "add-sso created session" "$out1" "sso_region = eu-west-2"
 "$BIN" add-sso personal --start-url https://d-1.awsapps.com/start --sso-region us-east-1 --yes --non-interactive >/dev/null 2>&1
-out2="$(cat "$CONFIG_D/10-sso.conf")"
+out2="$(cat "$CONFIG_D/010-sso.conf")"
 assert_contains "add-sso update changes region" "$out2" "sso_region = us-east-1"
-count=$(grep -c '^\[sso-session personal\]' "$CONFIG_D/10-sso.conf")
+count=$(grep -c '^\[sso-session personal\]' "$CONFIG_D/010-sso.conf")
 assert_eq "add-sso update does not duplicate the section" "1" "$count"
 
 setup_case "addsso_normalizes_http_prefix"
 "$BIN" init -y >/dev/null 2>&1
 "$BIN" add-sso personal --start-url http://d-1.awsapps.com/start --sso-region eu-west-2 --yes --non-interactive >/dev/null 2>&1
-out_http="$(cat "$CONFIG_D/10-sso.conf")"
+out_http="$(cat "$CONFIG_D/010-sso.conf")"
 assert_contains "add-sso normalizes http prefix" "$out_http" "sso_start_url = https://d-1.awsapps.com/start"
 
 setup_case "addsso_normalizes_missing_https_prefix"
 "$BIN" init -y >/dev/null 2>&1
 "$BIN" add-sso personal --start-url d-1.awsapps.com/start --sso-region eu-west-2 --yes --non-interactive >/dev/null 2>&1
-out_https="$(cat "$CONFIG_D/10-sso.conf")"
+out_https="$(cat "$CONFIG_D/010-sso.conf")"
 assert_contains "add-sso prefixes missing https" "$out_https" "sso_start_url = https://d-1.awsapps.com/start"
 
 setup_case "addsso_normalizes_missing_start_suffix"
 "$BIN" init -y >/dev/null 2>&1
 "$BIN" add-sso personal --start-url https://d-1.awsapps.com --sso-region eu-west-2 --yes --non-interactive >/dev/null 2>&1
-out3="$(cat "$CONFIG_D/10-sso.conf")"
+out3="$(cat "$CONFIG_D/010-sso.conf")"
 assert_contains "add-sso normalizes missing /start" "$out3" "sso_start_url = https://d-1.awsapps.com/start"
 
 setup_case "addsso_rejects_invalid_normalized_url"
@@ -590,6 +644,37 @@ else
     pass "doctor clean after all profile types added"
 fi
 
+setup_case "addprofile_sso_auto_places_by_session_range"
+"$BIN" init -y >/dev/null 2>&1
+"$BIN" add-sso personal --start-url https://d-1.awsapps.com/start --sso-region eu-west-2 --yes --non-interactive >/dev/null 2>&1
+"$BIN" add-profile p-auto --type sso --sso-session personal --sso-account-id 111122223333 --sso-role-name Foo --region eu-west-2 --yes --non-interactive >/dev/null 2>&1
+assert_true "SSO profile auto-places into session-owned range" "$([[ -f "$CONFIG_D/200-p-auto.conf" ]] && echo 0 || echo 1)"
+
+setup_case "addprofile_sso_out_of_range_override_warns_nonstrict"
+"$BIN" init -y >/dev/null 2>&1
+warn_out="$($BIN add-sso personal --start-url https://d-1.awsapps.com/start --sso-region eu-west-2 --yes --non-interactive 2>&1 >/dev/null)"
+warn_out="$($BIN add-profile p-warn --type sso --sso-session personal --sso-account-id 111122223333 --sso-role-name Foo --region eu-west-2 --file 020-p-warn.conf --yes --non-interactive 2>&1 >/dev/null)"
+assert_contains "out-of-range override warns in non-strict mode" "$warn_out" "outside the declared range"
+assert_true "out-of-range override still writes in non-strict mode" "$([[ -f "$CONFIG_D/020-p-warn.conf" ]] && echo 0 || echo 1)"
+
+setup_case "addprofile_sso_out_of_range_override_fails_strict"
+"$BIN" init -y >/dev/null 2>&1
+cat > "$XDG_CONFIG_HOME/awsconfd/scheme.conf" << 'EOF'
+[awsconfd]
+version = 1
+strict  = true
+
+[scheme]
+00 = defaults
+10 = sso-sessions
+200-209 = personal
+EOF
+"$BIN" add-sso personal --start-url https://d-1.awsapps.com/start --sso-region eu-west-2 --yes --non-interactive >/dev/null 2>&1
+strict_err="$($BIN add-profile p-strict --type sso --sso-session personal --sso-account-id 111122223333 --sso-role-name Foo --region eu-west-2 --file 020-p-strict.conf --yes --non-interactive 2>&1 >/dev/null)"
+rc=$?
+assert_exit "out-of-range override fails in strict mode" "1" "$rc"
+assert_contains "strict out-of-range override is explained" "$strict_err" "outside the declared range"
+
 # =============================================================================
 section "apply --spec"
 # =============================================================================
@@ -603,9 +688,44 @@ version = 1
 strict  = false
 
 [awsconfd:scheme]
-00    = defaults
-10    = sso-sessions
-2x    = personal
+000     = defaults
+010     = sso-sessions
+200-209 = personal
+
+[awsconfd:layout]
+default                = 000-defaults.conf
+sso-session personal   = 010-sso.conf
+profile personal-admin = 200-personal-admin.conf
+
+[default]
+output = json
+
+[sso-session personal]
+sso_start_url = https://d-1.awsapps.com/start
+sso_region    = eu-west-2
+
+[profile personal-admin]
+sso_session    = personal
+sso_account_id = 111122223333
+sso_role_name  = AdministratorAccess
+region         = eu-west-2
+EOF
+"$BIN" apply --spec "${_case_dir}/spec.ini" >/dev/null 2>&1
+assert_exit "apply --spec succeeds" "0" "$?"
+assert_true "layout-named fragments created" "$([[ -f "$CONFIG_D/200-personal-admin.conf" ]] && echo 0 || echo 1)"
+reapply_out="$("$BIN" apply --spec "${_case_dir}/spec.ini" 2>&1)"
+assert_contains "re-applying reports SKIP for existing sections" "$reapply_out" "SKIP"
+
+setup_case "apply_spec_legacy_layout_rejected_in_modern_tree"
+"$BIN" init -y >/dev/null 2>&1
+cat > "${_case_dir}/legacy-layout.spec.ini" << 'EOF'
+[awsconfd]
+version = 1
+
+[awsconfd:scheme]
+00 = defaults
+10 = sso-sessions
+2x = personal
 
 [awsconfd:layout]
 default                = 00-defaults.conf
@@ -625,11 +745,46 @@ sso_account_id = 111122223333
 sso_role_name  = AdministratorAccess
 region         = eu-west-2
 EOF
-"$BIN" apply --spec "${_case_dir}/spec.ini" >/dev/null 2>&1
-assert_exit "apply --spec succeeds" "0" "$?"
-assert_true "layout-named fragments created" "$([[ -f "$CONFIG_D/20-personal-admin.conf" ]] && echo 0 || echo 1)"
-reapply_out="$("$BIN" apply --spec "${_case_dir}/spec.ini" 2>&1)"
-assert_contains "re-applying reports SKIP for existing sections" "$reapply_out" "SKIP"
+legacy_err="$($BIN apply --spec "${_case_dir}/legacy-layout.spec.ini" 2>&1 >/dev/null)"
+rc=$?
+assert_exit "legacy explicit layout is rejected in modern tree" "2" "$rc"
+assert_contains "legacy explicit layout rejection is explained" "$legacy_err" "--force-modern-layout"
+
+setup_case "apply_spec_force_modern_layout"
+"$BIN" init -y >/dev/null 2>&1
+cp "${_case_dir}/../apply_spec_legacy_layout_rejected_in_modern_tree/legacy-layout.spec.ini" "${_case_dir}/legacy-layout.spec.ini" 2>/dev/null || cat > "${_case_dir}/legacy-layout.spec.ini" << 'EOF'
+[awsconfd]
+version = 1
+
+[awsconfd:scheme]
+00 = defaults
+10 = sso-sessions
+2x = personal
+
+[awsconfd:layout]
+default                = 00-defaults.conf
+sso-session personal   = 10-sso.conf
+profile personal-admin = 20-personal-admin.conf
+
+[default]
+output = json
+
+[sso-session personal]
+sso_start_url = https://d-1.awsapps.com/start
+sso_region    = eu-west-2
+
+[profile personal-admin]
+sso_session    = personal
+sso_account_id = 111122223333
+sso_role_name  = AdministratorAccess
+region         = eu-west-2
+EOF
+force_out="$($BIN apply --spec "${_case_dir}/legacy-layout.spec.ini" --force-modern-layout 2>&1)"
+rc=$?
+assert_exit "legacy spec can be modernized explicitly" "0" "$rc"
+assert_contains "modernization is logged" "$force_out" "modernized legacy layout"
+assert_true "modernized default fragment created" "$([[ -f "$CONFIG_D/000-defaults.conf" ]] && echo 0 || echo 1)"
+assert_true "modernized SSO profile created in session range" "$([[ -f "$CONFIG_D/200-personal-admin.conf" ]] && echo 0 || echo 1)"
 
 setup_case "apply_spec_stdin"
 "$BIN" init -y >/dev/null 2>&1
@@ -640,7 +795,7 @@ cat > "${_case_dir}/spec.ini" << 'EOF'
 version = 1
 
 [awsconfd:layout]
-default = 00-defaults.conf
+default = 000-defaults.conf
 
 [default]
 output = json
@@ -648,6 +803,145 @@ EOF
 "$BIN" apply --spec - < "${_case_dir}/spec.ini" >/dev/null 2>&1
 }
 assert_exit "apply --spec - reads stdin" "0" "$?"
+
+# =============================================================================
+section "Migrate"
+# =============================================================================
+
+setup_case "migrate_dry_run"
+mkdir -p "$CONFIG_D" "$XDG_CONFIG_HOME/awsconfd"
+cat > "$XDG_CONFIG_HOME/awsconfd/scheme.conf" << 'EOF'
+[awsconfd]
+version = 1
+strict  = false
+
+[scheme]
+00 = defaults
+10 = sso-sessions
+2x = personal
+30-39 = customer-a
+99 = imported
+EOF
+cat > "$CONFIG_D/00-defaults.conf" << 'EOF'
+[default]
+output = json
+EOF
+cat > "$CONFIG_D/10-sso.conf" << 'EOF'
+[sso-session personal]
+sso_start_url = https://d-1.awsapps.com/start
+sso_region = eu-west-2
+EOF
+cat > "$CONFIG_D/20-personal-admin.conf" << 'EOF'
+[profile personal-admin]
+sso_session = personal
+sso_account_id = 111122223333
+sso_role_name = AdministratorAccess
+region = eu-west-2
+EOF
+dry_migrate="$($BIN migrate --dry-run 2>&1)"
+assert_contains "migrate dry-run reports defaults rename" "$dry_migrate" "RENAME 00-defaults.conf -> 000-defaults.conf"
+assert_contains "migrate dry-run reports scheme rewrite" "$dry_migrate" "REWRITE scheme.conf"
+assert_true "migrate dry-run leaves legacy defaults in place" "$([[ -f "$CONFIG_D/00-defaults.conf" ]] && echo 0 || echo 1)"
+assert_true "migrate dry-run does not create modern defaults" "$([[ ! -f "$CONFIG_D/000-defaults.conf" ]] && echo 0 || echo 1)"
+
+setup_case "migrate_legacy_managed_tree"
+mkdir -p "$CONFIG_D" "$XDG_CONFIG_HOME/awsconfd"
+cat > "$XDG_CONFIG_HOME/awsconfd/scheme.conf" << 'EOF'
+[awsconfd]
+version = 1
+strict  = false
+
+[scheme]
+00 = defaults
+10 = sso-sessions
+2x = personal
+30-39 = customer-a
+99 = imported
+EOF
+cat > "$CONFIG_D/00-defaults.conf" << 'EOF'
+[default]
+output = json
+EOF
+cat > "$CONFIG_D/10-sso.conf" << 'EOF'
+[sso-session personal]
+sso_start_url = https://d-1.awsapps.com/start
+sso_region = eu-west-2
+
+[sso-session customer-a]
+sso_start_url = https://d-2.awsapps.com/start
+sso_region = eu-west-2
+EOF
+cat > "$CONFIG_D/20-personal-admin.conf" << 'EOF'
+[profile personal-admin]
+sso_session = personal
+sso_account_id = 111122223333
+sso_role_name = AdministratorAccess
+region = eu-west-2
+EOF
+cat > "$CONFIG_D/21-personal-readonly.conf" << 'EOF'
+[profile personal-ro]
+sso_session = personal
+sso_account_id = 111122223333
+sso_role_name = ReadOnlyAccess
+region = eu-west-2
+EOF
+cat > "$CONFIG_D/30-customer-a-audit.conf" << 'EOF'
+[profile customer-a-audit]
+sso_session = customer-a
+sso_account_id = 444455556666
+sso_role_name = SecurityAudit
+region = eu-west-2
+EOF
+cat > "$CONFIG_D/99-imported.conf" << 'EOF'
+[profile imported]
+region = eu-west-2
+EOF
+migrate_out="$($BIN migrate --yes 2>&1)"
+assert_contains "migrate logs defaults rename" "$migrate_out" "00-defaults.conf -> 000-defaults.conf"
+assert_true "defaults migrated to 000" "$([[ -f "$CONFIG_D/000-defaults.conf" ]] && echo 0 || echo 1)"
+assert_true "sso migrated to 010" "$([[ -f "$CONFIG_D/010-sso.conf" ]] && echo 0 || echo 1)"
+assert_true "personal admin migrated into 200-range" "$([[ -f "$CONFIG_D/200-personal-admin.conf" ]] && echo 0 || echo 1)"
+assert_true "personal ro migrated into 200-range" "$([[ -f "$CONFIG_D/201-personal-readonly.conf" ]] && echo 0 || echo 1)"
+assert_true "customer-a migrated into next range" "$([[ -f "$CONFIG_D/210-customer-a-audit.conf" ]] && echo 0 || echo 1)"
+assert_true "imported migrated to 990" "$([[ -f "$CONFIG_D/990-imported.conf" ]] && echo 0 || echo 1)"
+assert_true "old managed defaults removed" "$([[ ! -f "$CONFIG_D/00-defaults.conf" ]] && echo 0 || echo 1)"
+scheme_now="$(cat "$XDG_CONFIG_HOME/awsconfd/scheme.conf")"
+assert_contains "scheme rewritten with modern defaults" "$scheme_now" "000 = defaults"
+assert_contains "scheme rewritten with personal range" "$scheme_now" "200-209 = personal"
+assert_contains "scheme rewritten with customer-a range" "$scheme_now" "210-219 = customer-a"
+doctor_err="$($BIN doctor 2>&1)"
+if [[ "$doctor_err" == *"ERROR"* || "$doctor_err" == *"W2"* ]]; then
+    fail "migrated managed tree validates cleanly" "$doctor_err"
+else
+    pass "migrated managed tree validates cleanly"
+fi
+
+setup_case "migrate_leaves_unmanaged_oddities"
+mkdir -p "$CONFIG_D" "$XDG_CONFIG_HOME/awsconfd"
+cat > "$XDG_CONFIG_HOME/awsconfd/scheme.conf" << 'EOF'
+[awsconfd]
+version = 1
+strict  = false
+
+[scheme]
+00 = defaults
+10 = sso-sessions
+2x = personal
+EOF
+cat > "$CONFIG_D/20-personal-admin.conf" << 'EOF'
+[profile personal-admin]
+sso_session = personal
+sso_account_id = 111122223333
+sso_role_name = AdministratorAccess
+region = eu-west-2
+EOF
+cat > "$CONFIG_D/77-odd.conf" << 'EOF'
+[profile odd]
+region = eu-west-2
+EOF
+"$BIN" migrate --yes >/dev/null 2>&1
+assert_true "migrate leaves unmanaged oddity untouched" "$([[ -f "$CONFIG_D/77-odd.conf" ]] && echo 0 || echo 1)"
+assert_true "migrate still moves managed profile" "$([[ -f "$CONFIG_D/200-personal-admin.conf" ]] && echo 0 || echo 1)"
 
 # =============================================================================
 section "Watch"
@@ -750,6 +1044,23 @@ EOF
 assert_true "disable resolves bare prefix" "$([[ -f "$CONFIG_D/20-a.conf.disabled" ]] && echo 0 || echo 1)"
 "$BIN" enable 20-a.conf.disabled >/dev/null 2>&1
 assert_true "enable resolves full disabled filename" "$([[ -f "$CONFIG_D/20-a.conf" ]] && echo 0 || echo 1)"
+
+setup_case "enable_disable_ambiguous_prefix_rejected"
+"$BIN" init -y >/dev/null 2>&1
+cat > "$CONFIG_D/20-a.conf" << 'EOF'
+[profile a]
+region = eu-west-2
+EOF
+cat > "$CONFIG_D/200-b.conf" << 'EOF'
+[profile b]
+region = eu-west-2
+EOF
+amb_err="$($BIN disable 20 2>&1 >/dev/null)"
+rc=$?
+assert_exit "ambiguous shorthand disable fails" "1" "$rc"
+assert_contains "ambiguous shorthand disable explains candidates" "$amb_err" "ambiguous"
+assert_contains "ambiguous shorthand disable lists 20-a" "$amb_err" "20-a"
+assert_contains "ambiguous shorthand disable lists 200-b" "$amb_err" "200-b"
 
 # =============================================================================
 printf '\n=== Summary ===\n'
